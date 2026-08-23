@@ -36,7 +36,7 @@ def load_tasks(limit: int | None = None) -> list[dict]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="run_eval")
-    parser.add_argument("--provider", choices=["local", "tavily"], default=None)
+    parser.add_argument("--provider", choices=["local", "tavily", "bocha"], default=None)
     parser.add_argument("--limit", type=int, default=None, help="只跑前 N 个任务")
     parser.add_argument("--no-reflect", action="store_true")
     parser.add_argument("--react-mode", choices=["native", "prompt"], default=None)

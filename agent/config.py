@@ -24,8 +24,9 @@ TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
 # off=强制关闭 on=强制开启
 THINK_MODE = os.getenv("THINK_MODE", "auto")
 
-SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "local")  # local | tavily
+SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "local")  # local | tavily | bocha
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+BOCHA_API_KEY = os.getenv("BOCHA_API_KEY", "")
 # basic=快但相关性差（1 credit）| advanced=相关性更好（2 credits），实测对中文/专有名词查询提升明显
 TAVILY_SEARCH_DEPTH = os.getenv("TAVILY_SEARCH_DEPTH", "advanced")
 # 是否走系统代理（如 Clash）。实测系统代理不稳时 Tavily 会出现 SSL 断连/403，

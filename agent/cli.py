@@ -56,7 +56,7 @@ def _print_stats(console: Console, result: RunResult) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agent", description="基于 Ollama + Qwen2.5-3B 的深度调研 Agent")
     parser.add_argument("question", help="调研问题")
-    parser.add_argument("--provider", choices=["local", "tavily"], default=None,
+    parser.add_argument("--provider", choices=["local", "tavily", "bocha"], default=None,
                         help="搜索提供方（默认取 .env 的 SEARCH_PROVIDER）")
     parser.add_argument("--max-steps", type=int, default=None, help="ReAct 单轮最大步数")
     parser.add_argument("--no-reflect", action="store_true", help="跳过反思补搜阶段")

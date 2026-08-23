@@ -32,6 +32,9 @@ def research(q: str, provider: str | None = None):
         return StreamingResponse(iter(["data: " + json.dumps(
             {"event": "error", "data": {"message": "问题不能为空"}}, ensure_ascii=False) + "\n\n"]),
             media_type="text/event-stream")
+    # 只允许已知搜索源，防止前端传任意值
+    if provider not in (None, "local", "tavily", "bocha"):
+        provider = None
 
     events: queue.Queue = queue.Queue()
 

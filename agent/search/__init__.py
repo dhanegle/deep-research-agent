@@ -11,4 +11,7 @@ def build_provider(name: str | None = None) -> SearchProvider:
     if name == "tavily":
         from .tavily import TavilyProvider
         return TavilyProvider(config.TAVILY_API_KEY)
+    if name == "bocha":
+        from .bocha import BochaProvider
+        return BochaProvider(config.BOCHA_API_KEY)
     raise ValueError(f"未知搜索提供方: {name}")
