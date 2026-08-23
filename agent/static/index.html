@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deep Research Agent</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<style>
+  :root {
+    --bg: #f5f7fa; --card: #ffffff; --border: #e2e8f0; --text: #1a202c;
+    --dim: #718096; --accent: #3182ce; --green: #2f855a; --mono: "Cascadia Code", Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 24px 16px 60px; }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 20px; }
+  header h1 { font-size: 22px; }
+  header .sub { color: var(--dim); font-size: 13px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+  .row { display: flex; gap: 10px; }
+  .row input[type=text] { flex: 1; font-size: 15px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px; outline: none; }
+  .row input[type=text]:focus { border-color: var(--accent); }
+  select { border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: white; color: var(--text); }
+  button { background: var(--accent); color: white; border: none; border-radius: 8px; padding: 10px 22px; font-size: 15px; cursor: pointer; }
+  button:disabled { background: #a0c4e8; cursor: not-allowed; }
+  h2 { font-size: 15px; color: var(--dim); margin-bottom: 12px; font-weight: 600; }
+  #steps { font-family: var(--mono); font-size: 13px; line-height: 1.9; max-height: 340px; overflow-y: auto; }
+  .step { display: flex; gap: 8px; align-items: baseline; }
+  .step .tag { flex-shrink: 0; width: 64px; font-weight: bold; }
+  .t-plan { color: #805ad5; } .t-search { color: #d69e2e; } .t-read { color: var(--green); }
+  .t-reflect { color: #d53f8c; } .t-write { color: var(--accent); } .t-research { color: var(--accent); }
+  .step .body { color: var(--text); word-break: break-all; }
+  .dim { color: var(--dim); }
+  #report { line-height: 1.8; font-size: 14.5px; }
+  #report h1 { font-size: 22px; margin: 8px 0 14px; }
+  #report h2 { font-size: 17px; color: var(--text); margin: 22px 0 8px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  #report blockquote { border-left: 3px solid var(--accent); background: #ebf8ff; padding: 8px 12px; border-radius: 4px; color: var(--dim); font-size: 12.5px; margin: 10px 0; }
+  #report pre { font-family: var(--mono); white-space: pre-wrap; }
+  #stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; margin-top: 14px; }
+  .stat { background: #f7fafc; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 13px; }
+  .stat b { display: block; font-size: 17px; margin-top: 2px; }
+  .err { color: #c53030; font-weight: bold; }
+  .placeholder { color: var(--dim); font-size: 13.5px; text-align: center; padding: 30px 0; }
+  #bar { height: 3px; background: linear-gradient(90deg, #63b3ed, #3182ce, #63b3ed); background-size: 200% 100%;
+         animation: flow 1.2s linear infinite; border-radius: 2px; margin-top: 14px; display: none; }
+  @keyframes flow { from { background-position: 0 0; } to { background-position: 200% 0; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>🔍 Deep Research Agent</h1>
+    <span class="sub">Ollama · Qwen2.5-3B · 手写 Agent 循环（规划 → 搜索 → 阅读 → 反思 → 成文）</span>
+  </header>
+
+  <div class="card">
+    <div class="row">
+      <input type="text" id="q" placeholder="输入调研问题，例如：2025年国产新能源汽车出口情况">
+      <select id="provider">
+        <option value="tavily">tavily（联网）</option>
+        <option value="local">本地文档（data/）</option>
+      </select>
+      <button id="btn" onclick="run()">开始调研</button>
+    </div>
+    <div id="bar"></div>
+  </div>
+
+  <div class="card">
+    <h2>实时过程</h2>
+    <div id="steps"><div class="placeholder">点击「开始调研」后，这里会实时展示 Agent 的每一步</div></div>
+  </div>
+
+  <div class="card" id="report-card" style="display:none">
+    <h2>调研报告</h2>
+    <div id="report"></div>
+    <div id="stats"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let finished = false;
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function addStep(event, d) {
+  const steps = $('steps');
+  if (steps.querySelector('.placeholder')) steps.innerHTML = '';
+  const icon = {start:'🚀', plan:'📋', search:'🔍', read:'📄', research:'⚙️', reflect:'🤔', write:'✍️'}[event] || '·';
+  let text = '';
+  if (event === 'start')       text = `调研问题：${d.question}`;
+  else if (event === 'plan')   text = `大纲：${d.outline.join('；')}<div class="dim">搜索词：${d.queries.join('、')}</div>`;
+  else if (event === 'search') text = `${esc(d.query)} → ${d.results} 条结果`;
+  else if (event === 'read')   text = `收录[${d.source_id}] 《${esc(d.title)}》`;
+  else if (event === 'reflect')text = d.sufficient ? `资料充分` : `存在缺口 → 补搜 ${d.gap_queries.join('、')}`;
+  else if (event === 'write')  { startStreaming(d.sections); text = `${esc(d.status)} 小节：${d.sections.join('、')}`; }
+  else                         text = esc(d.status || JSON.stringify(d));
+  const div = document.createElement('div');
+  div.className = 'step';
+  div.innerHTML = `<span class="tag t-${event}">${icon} ${event}</span><span class="body">${text}</span>`;
+  steps.appendChild(div);
+  steps.scrollTop = steps.scrollHeight;
+}
+
+let streamBuf = '';
+function startStreaming(sections) {
+  $('report-card').style.display = '';
+  streamBuf = '';
+  $('report').innerHTML = '<span class="dim">✍️ 生成中…</span>';
+}
+function appendChunk(text) {
+  if (streamBuf === '') $('report').innerHTML = '';
+  streamBuf += text;
+  const html = window.marked ? marked.parse(streamBuf) : `<pre>${esc(streamBuf)}</pre>`;
+  $('report').innerHTML = html;
+}
+
+function renderReport(d) {
+  $('report-card').style.display = '';
+  const html = window.marked ? marked.parse(d.report) : `<pre>${esc(d.report)}</pre>`;
+  $('report').innerHTML = html;
+  const s = d.stats;
+  const items = [
+    ['来源数 / LLM 调用', `${s.pages_fetched} 条 / ${s.llm_calls} 次`],
+    ['结构化输出首试成功率', `${(s.json_first_try_rate * 100).toFixed(0)}%（重试兜底后 100%）`],
+    ['工具调用有效率', `${(s.tool_valid_rate * 100).toFixed(0)}%（非法 ${s.tool_invalid}/${s.tool_calls}）`],
+    ['搜索 / 反思轮次', `${s.searches} 次 / ${s.reflect_rounds} 轮`],
+    ['总耗时', `${s.total_seconds}s`],
+  ];
+  $('stats').innerHTML = items.map(([k, v]) => `<div class="stat">${k}<b>${v}</b></div>`).join('')
+    + `<div class="stat">报告文件<b style="font-size:11px;word-break:break-all">${esc(d.report_path)}</b></div>`;
+}
+
+function fail(msg) {
+  const steps = $('steps');
+  const div = document.createElement('div');
+  div.className = 'step';
+  div.innerHTML = `<span class="tag err">✗</span><span class="body err">${esc(msg)}</span>`;
+  steps.appendChild(div);
+  reset();
+}
+
+function reset() {
+  finished = true;
+  $('btn').disabled = false;
+  $('bar').style.display = 'none';
+}
+
+function run() {
+  const q = $('q').value.trim();
+  if (!q) { alert('请输入调研问题'); return; }
+  finished = false;
+  $('btn').disabled = true;
+  $('bar').style.display = 'block';
+  $('steps').innerHTML = '';
+  $('report-card').style.display = 'none';
+  const provider = $('provider').value;
+  const es = new EventSource(`/api/research?q=${encodeURIComponent(q)}&provider=${provider}`);
+  es.onmessage = e => {
+    const {event, data} = JSON.parse(e.data);
+    if (event === 'done') { renderReport(data); reset(); es.close(); }
+    else if (event === 'error') { fail(data.message); es.close(); }
+    else if (event === 'chunk') { appendChunk(data.text); }
+    else addStep(event, data);
+  };
+  es.onerror = () => { if (!finished) fail('连接中断（服务是否仍在运行？）'); es.close(); reset(); };
+}
+</script>
+</body>
+</html>

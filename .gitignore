@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+cache/
+reports/
+traces/
+eval/results/
+eval/ablation_output.log
+web.log
+.zcode/
