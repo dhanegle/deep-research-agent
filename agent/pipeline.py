@@ -1,4 +1,4 @@
-"""管线编排：规划 → ReAct 收集 → 反思补搜（最多 N 轮）→ 分节写作 → 落盘。
+"""管线编排：规划 → ReAct 收集 → 反思补搜（≤N 轮）→ 分节写作 → 报告自审修订 → 落盘。
 
 on_step 回调把每个阶段事件实时抛给 CLI / Web UI 展示。
 """
@@ -15,9 +15,10 @@ from .llm import LLM
 from .planner import plan_question
 from .reflector import reflect
 from .researcher import Researcher
+from .reviewer import review_report
 from .stats import RunStats
 from .trace import StepCallback, Trace
-from .writer import _validate_report, iter_report
+from .writer import _generate_section, _replace_section, _validate_report, iter_report
 
 
 @dataclass
@@ -101,6 +102,42 @@ class ResearchPipeline:
             if self.on_chunk:
                 self.on_chunk(piece)
         body = _validate_report("".join(chunks), kb)
+
+        # 阶段 E：报告自审+修订（固定 1 轮，对称于阶段 C 的搜-反思）
+        review = review_report(self.llm, question, plan, body, kb)
+        self.stats.review_rounds += 1
+        self.stats.review_issues = len(review.issues)
+        self.trace.log("review", sufficient=review.sufficient,
+                       issues=[i.model_dump() for i in review.issues])
+        emit("review", {"sufficient": review.sufficient,
+                        "issues": [i.model_dump() for i in review.issues]})
+        if not review.sufficient:
+            emit("review", {"status": "自审发现不足，修订中…"})
+            # E1: 占位节触发补搜（对称于 C 的 researcher.run 补搜）
+            gaps = review.gap_queries
+            if gaps:
+                emit("research", {"status": f"自审补搜：{gaps}"})
+                before = len(kb)
+                researcher.run(question, plan.outline, gaps, max_steps=4)
+                if len(kb) == before:
+                    researcher.scripted_collect(gaps, per_query_pages=1)
+            # E2: 重写有问题的节
+            revised = 0
+            for issue in review.issues:
+                sources = kb.select_for(issue.section, question, k=5)
+                if not sources:
+                    continue
+                material = "\n\n".join(f"[{s.id}] 《{s.title}》\n{s.digest}" for s in sources)
+                new_body = _generate_section(
+                    self.llm, question, issue.section, material, {s.id for s in sources}
+                )
+                body = _replace_section(body, issue.section, new_body)
+                revised += 1
+            self.stats.review_revised = revised
+            body = _validate_report(body, kb)
+            self.trace.log("review_revised", revised=revised)
+            emit("review", {"status": f"修订完成，重写 {revised} 节"})
+
         self.stats.total_seconds = round(time.time() - t0, 1)
         meta = (f"> 模型 `{config.MODEL}` | 来源 {len(kb)} 条 | LLM 调用 {self.stats.llm_calls} 次 | "
                 f"耗时 {self.stats.total_seconds}s | trace `{self.trace.run_id}`")

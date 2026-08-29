@@ -16,6 +16,9 @@ class RunStats:
     pages_fetched: int = 0
     digest_calls: int = 0
     reflect_rounds: int = 0
+    review_rounds: int = 0      # 报告自审轮次（0 或 1）
+    review_issues: int = 0     # 自审发现的问题数
+    review_revised: int = 0     # 自审实际重写的节数
     total_seconds: float = 0.0
 
     @property

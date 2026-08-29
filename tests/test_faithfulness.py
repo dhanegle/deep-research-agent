@@ -4,7 +4,7 @@
 找不到依据的记为存疑。这些测试锁定型号编号跳过、四舍五入容差、
 题目自带数字豁免等关键行为。
 """
-from eval.faithfulness import (
+from agent.factcheck import (
     extract_numbers, missing_numbers, cited_sentences, _iter_sentences,
 )
 
