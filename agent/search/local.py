@@ -80,7 +80,8 @@ class LocalDocsProvider(SearchProvider):
         退化为滑动 4 元组：相关文档因共享片段多而排在前面。"""
         out = []
         for t in terms:
-            if len(t) > 6:
+            # ASCII 专有名词不要切成 4 元组（linuxsb → linu/nuxs 会误命中）
+            if len(t) > 6 and not t.isascii():
                 out.extend(t[i:i + 4] for i in range(0, len(t) - 3, 2))
             else:
                 out.append(t)

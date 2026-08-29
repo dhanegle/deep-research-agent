@@ -70,6 +70,16 @@ class TestAsciiTokenHit:
         toks = query_tokens("linux.sb")
         assert ascii_token_hit("linuxsb 论坛", toks) is True
 
+    def test_year_alone_does_not_veto(self):
+        # 查询里的年份不能把没写年份的相关页整页丢掉
+        toks = query_tokens("2025 新能源汽车出口")
+        assert ascii_token_hit("中国新能源汽车出口欧洲", toks) is True
+
+    def test_year_does_not_replace_proper_noun(self):
+        toks = query_tokens("linuxsb 2025")
+        assert ascii_token_hit("linuxsb 社区介绍", toks) is True
+        assert ascii_token_hit("2025 年 Linux 内核发布", toks) is False
+
 
 class TestBigrams:
     def test_basic(self):
@@ -92,6 +102,35 @@ class TestKnowledgeBaseSelect:
         kb = self._kb()
         selected = kb.select_for("固态电池", "固态电池产业化", k=5)
         assert selected[0].title == "固态电池量产进展"
+
+    def test_drops_zero_section_overlap(self):
+        kb = self._kb()
+        # 「量子计算」与两条来源都无小节重合 → 库不足 k 条时仍返回，但排在最末
+        # （不再用门槛剔除——给足素材比严卡门槛更重要）
+        selected = kb.select_for("量子计算", "固态电池产业化", k=5)
+        assert len(selected) == 2  # 库只有 2 条，全部返回
+        # 与小节相关的应排在前面；这里两条都不相关，顺序按原 id
+        assert selected[0].title == "固态电池量产进展"
+
+    def test_question_overlap_alone_not_enough(self):
+        # 来源对上了问题词（linuxdo/社区）但对不上小节标题 → 不优先，但库不足时仍返回
+        kb = KnowledgeBase()
+        kb.add("u1", "linuxdo 邀请码获取", "填写50字申请即可加入社区")
+        selected = kb.select_for("活跃成员", "linuxdo是什么社区", k=5)
+        assert len(selected) == 1  # 库只有 1 条，返回它
+
+    def test_keeps_only_section_relevant(self):
+        kb = self._kb()
+        selected = kb.select_for("固态电池", "固态电池产业化", k=5)
+        assert [s.title for s in selected] == ["固态电池量产进展", "欧洲旅游攻略"]
+        # 相关的排在前，不相关的在后（不再剔除）
+
+    def test_prefers_section_4gram_over_generic_word(self):
+        kb = KnowledgeBase()
+        kb.add("u1", "货物贸易第一大国", "中国出口26.99万亿元，货物贸易顺差扩大")
+        kb.add("u2", "中国前十二大贸易伙伴", "东盟、欧盟、美国是主要贸易伙伴，国别结构变化")
+        selected = kb.select_for("贸易伙伴分析", "2026年我国的出口情况", k=5)
+        assert selected[0].title == "中国前十二大贸易伙伴"
 
     def test_has_section_material(self):
         kb = self._kb()

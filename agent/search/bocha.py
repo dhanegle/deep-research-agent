@@ -20,7 +20,7 @@ class BochaProvider(SearchProvider):
         self.cache = DiskCache("search")
 
     def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
-        key = f"bocha:{query}:{max_results}"
+        key = f"bocha:v2:{query}:{max_results}"
         cached = self.cache.get(key)
         if cached is not None:
             return [SearchResult(**r) for r in cached]
@@ -34,7 +34,6 @@ class BochaProvider(SearchProvider):
                 "query": query,
                 "count": max_results,
                 "summary": True,
-                "freshness": "oneYear",
             },
             timeout=20,
             trust_env=config.USE_SYSTEM_PROXY,
@@ -44,14 +43,19 @@ class BochaProvider(SearchProvider):
         # 博查返回结构：顶层 code/log_id/data，搜索结果在 data.webPages.value[] 中
         web = (data.get("data") or {}).get("webPages") or {}
         raw = web.get("value", [])
-        results = [
-            SearchResult(
+        results = []
+        for r in raw:
+            if not r.get("url"):
+                continue
+            summary = str(r.get("summary") or "")
+            snip = str(r.get("snippet") or "")
+            text = summary if summary else snip
+            if snip and snip not in text:
+                text = f"{text} {snip}".strip()
+            results.append(SearchResult(
                 title=str(r.get("name", ""))[:120],
                 url=r["url"],
-                snippet=str(r.get("summary") or r.get("snippet", ""))[:300],
-            )
-            for r in raw
-            if r.get("url")
-        ]
+                snippet=text[:800],
+            ))
         self.cache.put(key, [vars(r) for r in results])
         return results

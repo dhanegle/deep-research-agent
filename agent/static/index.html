@@ -93,7 +93,10 @@ function addStep(event, d) {
   let text = '';
   if (event === 'start')       text = `调研问题：${d.question}`;
   else if (event === 'plan')   text = `大纲：${d.outline.join('；')}<div class="dim">搜索词：${d.queries.join('、')}</div>`;
-  else if (event === 'search') text = `${esc(d.query)} → ${d.results} 条结果`;
+  else if (event === 'search') {
+    const extra = d.dropped ? `（过滤掉 ${d.dropped} 条不相关）` : '';
+    text = `${esc(d.query)} → ${d.results} 条结果${extra}`;
+  }
   else if (event === 'read')   text = `收录[${d.source_id}] 《${esc(d.title)}》`;
   else if (event === 'reflect')text = d.sufficient ? `资料充分` : `存在缺口 → 补搜 ${d.gap_queries.join('、')}`;
   else if (event === 'write')  { startStreaming(d.sections); text = `${esc(d.status)} 小节：${d.sections.join('、')}`; }

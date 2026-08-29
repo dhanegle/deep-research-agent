@@ -37,7 +37,7 @@ class TavilyProvider(SearchProvider):
             SearchResult(
                 title=str(r.get("title", ""))[:120],
                 url=r["url"],
-                snippet=str(r.get("content", ""))[:300],
+                snippet=str(r.get("content", ""))[:800],
             )
             for r in resp.json().get("results", [])
         ]

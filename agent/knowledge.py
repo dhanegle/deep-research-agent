@@ -12,6 +12,14 @@ def _bigrams(s: str) -> set[str]:
     return {s[i:i + 2] for i in range(len(s) - 1)}
 
 
+def _windows4(s: str) -> list[str]:
+    """小节标题的 4 字窗口：比二元组更能区分「货物贸易」和「贸易伙伴」。"""
+    s = re.sub(r"\s+", "", s)
+    if len(s) < 4:
+        return [s] if s else []
+    return [s[i:i + 4] for i in range(len(s) - 3)]
+
+
 def query_tokens(query: str) -> list[tuple[str, float]]:
     """把搜索词切成带权重的匹配元。
 
@@ -27,22 +35,33 @@ def query_tokens(query: str) -> list[tuple[str, float]]:
     return tokens
 
 
+def _is_ascii_proper(tok: str) -> bool:
+    """真正的专有名词：ASCII 且不是纯数字（年份不能一票否决整页）。"""
+    return tok.isascii() and not tok.isdigit()
+
+
+def ascii_proper_tokens(tokens: list[tuple[str, float]]) -> list[str]:
+    return [tok for tok, _ in tokens if _is_ascii_proper(tok)]
+
+
 def ascii_token_hit(text: str, tokens: list[tuple[str, float]]) -> bool:
-    """查询含 ASCII 专有名词（如 "linuxsb"、"2025"）时的强判别：
+    """查询含 ASCII 专有名词（如 "linuxsb"）时的强判别：
 
     结果必须至少命中其中一个，否则视为无关。防止"网站/介绍"这类泛词
     让 GitHub 上的"个人介绍网站.html"之类的页面混过覆盖率门槛。
-    不含 ASCII token 的纯中文查询恒为 True。
+    纯中文查询、或 ASCII 只是年份（2025）时恒为 True——年份用于排序加权，
+    不该把没写年份的相关页整页丢掉。
     """
+    proper = ascii_proper_tokens(tokens)
+    if not proper:
+        return True
     low = text.lower()
     compact = re.sub(r"[._\-]", "", low)
-    for tok, _ in tokens:
-        if not tok.isascii():
-            continue
+    for tok in proper:
         tok_c = re.sub(r"[._\-]", "", tok)
         if tok in low or tok in compact or tok_c in compact:
             return True
-    return not any(tok.isascii() for tok, _ in tokens)
+    return False
 
 
 def token_coverage(text: str, tokens: list[tuple[str, float]]) -> float:
@@ -61,7 +80,7 @@ def token_coverage(text: str, tokens: list[tuple[str, float]]) -> float:
         tok_c = re.sub(r"[._\-]", "", tok) if tok.isascii() else tok
         if tok in low or tok in compact or tok_c in compact:
             got += w
-        elif len(tok) >= 7 and not tok.isascii():
+        elif len(tok) >= 4 and not tok.isascii():
             grams = [tok[i:i + 4] for i in range(0, len(tok) - 3, 2)]
             if any(g in low for g in grams):
                 got += w * 0.5
@@ -100,10 +119,32 @@ class KnowledgeBase:
     def relevance(self, source: Source, section: str, question: str) -> int:
         return self._hits(source, _bigrams(section) | _bigrams(question))
 
+    def section_match(self, source: Source, section: str, question: str) -> tuple[int, int]:
+        """返回 (标题 4 字窗口命中数, 小节区别于问题的二元组命中数)。
+
+        4 字窗口用来把「货物贸易」和「贸易伙伴」分开；二元组作次级信号。
+        """
+        text = f"{source.title} {source.digest}"
+        w4 = sum(1 for w in _windows4(section) if w in text)
+        distinctive = _bigrams(section) - _bigrams(question)
+        d2 = sum(1 for t in distinctive if t in text) if distinctive else self._hits(source, _bigrams(section))
+        return w4, d2
+
     def select_for(self, section: str, question: str, k: int = 5) -> list[Source]:
-        """挑选与小节最相关的 k 条来源（按二元组重合度降序）。"""
-        ranked = sorted(self.sources, key=lambda s: (-self.relevance(s, section, question), s.id))
-        return ranked[:k]
+        """挑选与小节最相关的 k 条来源，始终返回 k 条（库不足时返回全部）。
+
+        4 字窗口与区别于问题的二元组只作排序加权，不作入选门槛——
+        实测把窗口当门槛会让每节只剩 1 条素材，3B 模型既要扣题又要带引用
+        难度过高，反而更倾向输出占位符。给足素材让模型有得选更重要。
+        """
+        sec_terms = _bigrams(section)
+        scored = []
+        for s in self.sources:
+            w4, d2 = self.section_match(s, section, question)
+            sec_hits = self._hits(s, sec_terms)
+            scored.append((w4, d2, sec_hits, s.id, s))
+        scored.sort(key=lambda x: (-x[0], -x[1], -x[2], x[3]))
+        return [s for *_, s in scored[:k]]
 
     def has_section_material(self, section: str) -> bool:
         """是否存在与小节标题直接相关的来源（仅用小节自身二元组判断）。"""
