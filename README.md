@@ -1,12 +1,29 @@
 # Deep Research Agent — 基于 Ollama + Qwen2.5-3B 的本地深度调研智能体
 
-用 **本地 3B 小模型** 跑通 OpenAI Deep Research 同款形态的调研 Agent：
-输入一个调研问题，自动完成 **规划 → 联网搜索 → 网页阅读 → 反思补搜 → 分节成文**，
-产出带引用来源的 Markdown 调研报告。**零框架依赖**（不用 LangChain/LlamaIndex），
-Agent 循环、工具调用、结构化输出约束、评估体系全部手写实现。
+<p align="center">
+  <a href="https://github.com/dhanegle/deep-research-agent/actions/workflows/ci.yml"><img src="https://github.com/dhanegle/deep-research-agent/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
+  <img src="https://img.shields.io/badge/LLM-ollama%20%7C%20qwen2.5--3b-8B5CF6" alt="Ollama">
+  <img src="https://img.shields.io/badge/framework-零框架依赖-orange" alt="No framework">
+</p>
 
-> 核心命题：大模型人人会调，**把 3B 小模型的工程可靠性做上来**才是本项目的亮点——
-> 所有架构决策都围绕"把开放推理降级为受限选择"展开，并用数据量化每项手段的收益。
+用 **本地 3B 小模型** 跑通 OpenAI Deep Research 同款形态的调研 Agent：
+输入一个调研问题，自动完成 **规划 → 联网搜索 → 网页阅读 → 反思补搜 → 分节成文 → 自审修订**，
+产出带引用来源的 Markdown 调研报告。
+
+> **核心命题：大模型人人会调，把 3B 小模型的工程可靠性做上来才是本项目的亮点。**
+> 所有架构决策都围绕"把开放推理降级为受限选择"展开，
+> Agent 循环、工具调用、结构化输出、评估体系全部手写实现（零 LangChain/LlamaIndex 依赖），
+> 并用数据量化每项手段的收益。
+
+## 为什么值得一看
+
+- **双反思闭环**：搜完反思"资料够不够"（阶段C），写完自审"报告对不对"（阶段E）——占位节自动触发补搜+重写，数字存疑逐句裁决
+- **三层可靠性防线**：非法工具调用回喂自修复 → JSON-ReAct 降级 → 规则确定性兜底，专治 3B 的参数幻觉与空转
+- **搜索质量治理四件套**：大纲空词自动改写、权威域名加权、单位内部页面降权、题库/文档站黑名单
+- **可复现评估**：搜索快照磁盘回放（零 API 消耗对比实验）+ 消融实验 + 引用忠实度双层校验
+- **消费级显卡可跑**：4GB 显存的入门 GPU 即可全流程本地运行，`local` 搜索源零 API key 开箱即用
 
 ## 架构
 
@@ -17,23 +34,32 @@ Agent 循环、工具调用、结构化输出约束、评估体系全部手写�
 ┌─────────────────────────────────────────────────────────────┐
 │ A 规划 Planner                                               │
 │   JSON Schema 约束 + pydantic 校验 + 失败回喂修复重试          │
-│   → 大纲 3-5 节 + 初始搜索词 2-4 个                          │
+│   → 大纲 3-5 节 + 初始搜索词 2-4 个（禁止大纲式标题词）         │
 ├─────────────────────────────────────────────────────────────┤
 │ B 信息收集 Researcher（ReAct 工具循环，核心）                  │
 │   Ollama 原生 tool calling，仅 2 个单参数工具：               │
-│     web_search(query) / read_page(url)                       │
+│     web_search(query) / read_page(path)                      │
 │   防线1 非法调用 → 错误回喂自修复                             │
 │   防线2 连续失败 → 降级 JSON-ReAct（提示词动作选择）           │
 │   防线3 整轮无产出 → 规则兜底采集（确定性脚本）                │
-│   正文分块 → 150字/块 LLM 摘要 → 知识库（上下文压缩）          │
+│   查询词治理：大纲空词自动拼问题核心词改写                     │
+│   结果治理：相关性过滤 + 权威加权 + 单位页面降权 + 黑名单      │
+│   正文 → 250字 LLM 摘要 → 知识库（上下文压缩）                │
 ├─────────────────────────────────────────────────────────────┤
-│ C 反思 Reflector                                             │
+│ C 反思 Reflector（搜-反思闭环）                               │
 │   「信息够不够」降级为 sufficient + gap_queries 受限输出       │
 │   覆盖度规则兜底：任一小节相关来源 <2 条 → 强制补搜            │
 ├─────────────────────────────────────────────────────────────┤
 │ D 写作 Writer                                                │
 │   分节生成（每节只注入相关性 top-5 摘要）                      │
-│   引用标记 [n] 仅允许指向真实抓取过的来源，幻觉引用自动剔除     │
+│   引用标记 [n] 白名单校验，幻觉引用自动剔除                    │
+│   零引用 → 请求补编号；重写失败保留首稿（校验降级而非丢弃）     │
+├─────────────────────────────────────────────────────────────┤
+│ E 自审 Reviewer（写-反思闭环，对称于 C）                      │
+│   ① 规则层(免费)：占位节可补 / 零引用 / 数字存疑              │
+│   ② LLM 结构审查(1次)：确认问题 + 为占位节生成补搜词           │
+│   ③ 逐句忠实度(3-6次)：存疑节逐句裁决，"不支持"才保留标记      │
+│   → 触发补搜（接回 B）+ 重写问题节 → 再过一次引用校验          │
 └─────────────────────────────────────────────────────────────┘
    │
    ▼
@@ -42,38 +68,44 @@ reports/*.md 调研报告   +   traces/*.jsonl 全链路追踪
 
 ## 快速开始
 
+**前置要求**：Python 3.10+，[Ollama](https://ollama.com) 已安装。
+
 ```bash
-# 1. 安装依赖（需要 Python 3.10+，Ollama 已运行 qwen2.5:3b）
+# 1. 拉模型（约 1.9GB）
+ollama pull qwen2.5:3b
+
+# 2. 安装依赖
+git clone https://github.com/dhanegle/deep-research-agent.git
+cd deep-research-agent
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt   # Windows
 # source .venv/bin/activate && pip install -r requirements.txt  # Linux/Mac
 
-# 跑单元测试（纯逻辑，不依赖 Ollama/网络）
-.venv\Scripts\python -m pytest tests/ -v
+# 3. 配置（默认 local 搜索源，零 API key 开箱即跑）
+cp .env.example .env
 
-# 2. 配置
-cp .env.example .env        # 两种搜索源：local（本地文件夹，默认）/ tavily（联网）
-
-# 3. 本地文档调研：把你的 md/txt/pdf/docx 文档放进 data/（LOCAL_DOCS_DIR 可改），然后
+# 4. 跑第一个调研（检索 data/ 示例语料，不联网）
 .venv\Scripts\python -m agent "2025年国产新能源汽车出口情况" --provider local
 
-# 4. Web UI（推荐）：浏览器打开 http://127.0.0.1:8000
-#    输入问题 → 实时看到搜索/阅读/反思/写作每一步 → 渲染完整报告与指标
+# 5. Web UI（推荐）：输入问题 → 实时看到每个阶段 → 渲染报告与指标
 .venv\Scripts\python -m agent.web
+# 浏览器打开 http://127.0.0.1:8000
 
-# 5. 真实联网调研（注册 tavily.com 免费 key，每月 1000 次）
-#    .env 中：SEARCH_PROVIDER=tavily  TAVILY_API_KEY=tvly-xxx
-.venv\Scripts\python -m agent "固态电池产业化最新进展"
+# 6. 真实联网调研（三种搜索源见下表）
+.venv\Scripts\python -m agent "固态电池产业化最新进展" --provider bocha
 ```
 
-### 两种搜索源（同一 SearchProvider 接口，可插拔）
+> 单元测试不依赖 Ollama 和网络，随时可跑：`.venv\Scripts\python -m pytest tests/ -v`
 
-| 搜索源 | 说明 |
-|---|---|
-| `local` | 把指定文件夹（默认 `data/`）当语料库：关键词（长词自动滑动切分）对文件名+正文打分排序；支持 md/txt/pdf/docx（txt 自动兼容 GBK）；返回相对路径作为"链接" |
-| `tavily` | 真实联网搜索，英文场景召回优，结果落盘快照供评估回放 |
-| `bocha` | 博查 AI 搜索（国内），中文召回优于 Tavily，结果含内容摘要 |
-```
+### 三种搜索源（同一 SearchProvider 接口，可插拔）
+
+| 搜索源 | 说明 | 适合 |
+|---|---|---|
+| `local` | 把 `data/` 文件夹当语料库：关键词滑动切分对文件名+正文打分；支持 md/txt/pdf/docx | **零配置开箱体验**、离线场景 |
+| `bocha` | [博查 AI 搜索](https://bochaai.com)（国内），中文召回好，直连无需代理 | **中文调研推荐** |
+| `tavily` | [Tavily](https://tavily.com)，英文场景召回优，有免费额度 | 英文调研 |
+
+联网源只需在 `.env` 里填对应 API key，Web UI 下拉框也可直接切换。
 
 ## 评估体系
 
@@ -83,11 +115,11 @@ cp .env.example .env        # 两种搜索源：local（本地文件夹，默认
    真实请求并快照；此后 `CACHE_MODE=replay` 全程读缓存——零 API 消耗、不依赖网络、
    结果逐位可复现，是提示词对比实验的基础设施。
 2. **评测集**：`eval/tasks.jsonl` 每任务附要点评分表（must_cover 关键词）。
-3. **指标**：要点覆盖率 / 结构化输出首试成功率 / 工具调用有效率 / 引用合规 / 引用忠实度与密度 / 耗时。
+3. **指标**：要点覆盖率 / 结构化输出首试成功率 / 工具调用有效率 / 引用忠实度与密度 / 耗时。
 
 ```bash
-# 首轮：真实搜索并落盘快照（消耗 Tavily 额度，一次性）
-CACHE_MODE=record SEARCH_PROVIDER=tavily .venv/Scripts/python eval/run_eval.py
+# 首轮：真实搜索并落盘快照（一次性，消耗搜索额度）
+CACHE_MODE=record SEARCH_PROVIDER=bocha .venv/Scripts/python eval/run_eval.py
 
 # 之后：回放对比实验（改提示词/关反思等，零成本复跑）
 CACHE_MODE=replay .venv/Scripts/python eval/run_eval.py --tag exp2
@@ -100,14 +132,12 @@ CACHE_MODE=replay .venv/Scripts/python eval/run_eval.py --no-reflect --tag basel
 |---|---|---|
 | 任务成功率 | 2/2 | 全流程无人工干预 |
 | 要点覆盖率 | 100%（9/9 关键词） | 评分表关键词全部命中 |
-| 结构化输出首试成功率 | 100% | 早期版本实测曾低至 50%，修复重试兜底后始终 100% 通过 |
-| 工具调用有效率 | 100% | 调优前曾因路径幻觉低至 39%，参数命名与容错匹配修复后见右表 |
-| 单份报告 LLM 调用 | 平均 27 次 | 含规划/搜索决策/摘要/反思/分节写作 |
-| 单份报告耗时 | 平均 ~39s | 消费级 GPU |
+| 结构化输出首试成功率 | 100% | 早期版本实测曾低至 50%，修复重试兜底后始终 100% |
+| 工具调用有效率 | 100% | 调优前曾因路径幻觉低至 39% |
+| 单份报告 LLM 调用 | 平均 27 次 | 含规划/搜索决策/摘要/反思/自审/分节写作 |
+| 单份报告耗时 | 平均 ~40s | 消费级 GPU（4GB 显存） |
 
-> 工程调优的量化对比：工具参数由 `url` 改名 `path` + 路径容错匹配后，
-> 同一任务工具有效率 **39% → 100%**（详见"为什么这些设计对 3B 模型是必要的"）。
-> 接入真实搜索后请用 `run_eval.py` 重跑并替换本表。
+> 接入真实搜索后请用 `run_eval.py` 重跑并替换本表——这正是评估体系的设计目的。
 
 ### 消融实验（4 配置 × 2 任务 × 3 次重复，local 语料）
 
@@ -118,85 +148,79 @@ CACHE_MODE=replay .venv/Scripts/python eval/run_eval.py --no-reflect --tag basel
 | **full**（完整版） | 6/6 | 100% | 86% | 24.2 | 36s |
 | no-reflect（去反思） | 6/6 | 100% | 100% | 15.0 | 27s |
 | prompt-react（提示词版工具调用） | 6/6 | 97% | **55%** | 30.5 | 31s |
-| naive（朴素提示词+无行为约束） | **5/6** | **83%** | 74% | 21.7 | **106s** |
 
-三个结论：
+## 为什么这些设计对 3B 模型是必要的
 
-1. **原生 tool calling 完胜提示词方案**：工具有效率 86% vs 55%——修复重试虽能兜住最终成功率，但每次非法调用都要多一轮"错误回喂+重试"（LLM 调用多 26%）；
-2. **行为约束是必要的**：去掉提示词规则与去重/预算后，成功率掉到 5/6、覆盖率 83%，且搜索空转使耗时近 3 倍（106s）；
-3. **反思阶段不是免费的**：在语料充足、首轮即可收齐资料的简单任务上，反思是纯开销（+9 次调用）——它的价值在首轮采集不足的稀疏话题上（联网调研 linuxsb 时即靠补搜轮拿回了 4 条来源）。这个负结果同样有价值：说明"反思"应当由覆盖度规则按需触发，而不是默认全开。
+每一条都来自真实 trace 复盘（`traces/*.jsonl` 全链路留痕），不是拍脑袋：
 
-### 引用忠实度校验（faithfulness）
-
-引用合规只保证 `[n]` 指向真实存在的来源（格式层）；忠实度校验进一步问**内容层**问题：
-被引来源的摘要真的支持那句话吗？`run_eval` 默认执行（`--no-faith` 跳过），两层实现（`eval/faithfulness.py`）：
-
-- **规则层（零成本）**：抽取句中数字与被引摘要比对，找不到依据的记"数字存疑"。
-  型号编号（Qwen2.5 / GPT-4 / 5G）与题目自带数字（如年份）不算；允许四舍五入容差
-  （来源 106.9 万 ↔ 句子"约107万"不误报）；
-- **LLM 层（低成本）**：数字存疑句优先、其余按序补足（上限 12 句/份），判
-  支持 / 部分支持 / 不支持，产出 `faithfulness = (支持 + 0.5×部分支持) / 已判定`。
-  判定集偏向可疑句，因此是对报告的**保守估计**。
-
-local 语料 2 任务 × 多轮实测：**被引用句忠实度 100%（11/11 支持）、数字存疑 0 句**；
-但**引用密度只有 0~14%（0/21 ~ 9/66 句带引用）**——忠实度只说明"被引用的部分没编造"，
-3B 写作的引用行为本身不稳定（偶尔通篇不标引用），大量论断无从溯源。
-这是评估体系暴露出的下一个改进点（写作提示词强化引用要求），数据如实记录在此。
+| 3B 的典型失败 | 本项目的对策 | 量化入口 |
+|---|---|---|
+| 工具调用格式错乱/编造参数（把 query 写成 path） | 少工具(2个)、单参数、错误回喂自修复、JSON-ReAct 降级 | tool_valid_rate / react_fallbacks |
+| 给路径编造 `https://` 前缀 | 参数命名 `url`→`path` + 前缀剥离后缀容错匹配（同一任务 39%→100%） | tool_valid_rate |
+| 把小节标题原样当搜索词（「政策影响因素」） | 查询词与问题核心词无实义重合时自动拼接改写；planner 提示词禁止大纲式标题词 | trace 中 query 改写记录 |
+| 口语词搜索只命中学校/单位通知页 | 官方口径词提示词规则 + 权威域名加权 + 单位内部页面降权 + 题库站黑名单 | 收录来源域名分布 |
+| 反复搜索同一关键词而不阅读（实测单轮空转 282 次） | 同轮查询去重直接顶回未读链接 + 单轮 12 次搜索预算（282→4 次） | searches / tool_calls |
+| JSON 输出偶尔不合法 | format=json + pydantic 校验 + 失败回喂重试 | json_first_try_rate |
+| 读 1 条就"宣布完成" | min_sources 约束 + nudge 顶回 + 反思补搜 | sources 数 / reflect_rounds |
+| 零引用被强制重写时摆烂输出"暂缺"，好正文被校验丢弃 | 校验降级而非丢弃：重写失败保留首稿，只剔幻觉引用 | 报告体量 / 暂缺节数 |
+| 报告数字与来源对不上（幻觉） | 阶段E 规则层数字比对 + LLM 逐句裁决，"不支持"才触发重写 | faithfulness / num_flags |
+| 没有时间概念，"今年/最新"按训练截止期理解 | 每次 LLM 调用注入当前日期；"今年/去年"进管线前确定性替换 | 搜索词年份 |
+| 长上下文注意力衰减 | 网页→250字摘要，每节只注入 top-5 相关摘要 | token 用量 |
+| 引用编号幻觉 | 引用编号白名单校验，写后剔除 | 报告引用合规 |
 
 ## 目录结构
 
 ```
 agent/
-  llm.py          # Ollama 封装：chat / chat_json(校验+修复) / chat_text
-  planner.py      # 阶段A 结构化规划
-  researcher.py   # 阶段B ReAct 循环 + 三条防线 + 分块摘要
-  reflector.py    # 阶段C 受限反思 + 覆盖度规则兜底
-  writer.py       # 阶段D 分节写作 + 幻觉引用剔除
-  knowledge.py    # 知识库：去重收录、按节相关性选材（字符二元组）
-  pipeline.py     # 四阶段编排 + 运行指标
+  llm.py          # Ollama 封装：chat / chat_json(校验+修复) / chat_text / stream_text
+  planner.py      # 阶段A 结构化规划（大纲+搜索词，禁大纲式标题词）
+  researcher.py   # 阶段B ReAct 循环 + 三防线 + 查询词改写 + 结果治理 + 分块摘要
+  reflector.py    # 阶段C 搜-反思闭环：受限反思 + 覆盖度规则兜底
+  writer.py       # 阶段D 分节写作 + 引用合规 + 校验降级（保首稿）
+  reviewer.py     # 阶段E 写-反思闭环：规则层→结构审查→逐句裁决→触发补搜重写
+  factcheck.py    # 事实核查原语：数字抽取比对 / 句子提取 / LLM 逐句裁决
+  knowledge.py    # 知识库：去重收录、按节相关性选材（4字窗口+二元组排序）
+  pipeline.py     # 五阶段编排 + 运行指标
   trace.py        # JSONL 全链路追踪
   cli.py          # rich 实时步骤展示
-  search/         # SearchProvider 接口 / 本地文件夹检索 / Tavily / 磁盘缓存 / 正文提取
+  web.py          # FastAPI + SSE 实时 Web UI
+  static/         # 前端单页
+  search/         # SearchProvider 接口 / local / tavily / bocha / 磁盘缓存 / 正文提取
 eval/
   tasks.jsonl     # 评测任务集（带要点评分表）
-  run_eval.py     # 回放评估入口（默认含引用忠实度校验，--no-faith 跳过）
+  run_eval.py     # 回放评估入口（默认含引用忠实度校验）
   metrics.py      # 覆盖率与汇总指标
-  faithfulness.py # 引用忠实度：规则层筛数字 + LLM 裁决，产出 faithfulness / 引用密度
-tests/            # 纯逻辑单元测试（JSON 修复、引用校验、路径容错、相关性过滤、忠实度规则层、指标）
+  faithfulness.py # 忠实度评估编排（原语在 agent/factcheck.py，两层共用）
+  ablation.sh     # 消融实验脚本
+tests/            # 120+ 纯逻辑单元测试（JSON修复/引用校验/路径容错/查询改写/降权/自审/忠实度）
 .github/workflows/ci.yml  # GitHub Actions：push/PR 自动跑测试
 ```
 
-## 为什么这些设计对 3B 模型是必要的
+## 常见问题
 
-| 3B 的典型失败 | 本项目的对策 | 量化入口 |
-|---|---|---|
-| 工具调用格式错乱/编造参数 | 少工具(2个)、单参数、错误回喂自修复、JSON-ReAct 降级 | tool_valid_rate / react_fallbacks |
-| 给路径编造 `https://` 前缀 | 参数命名 `url`→`path` + 提示词统一"路径"措辞 + 前缀剥离后缀容错匹配（实测同一任务 39%→100%） | tool_valid_rate |
-| 搜索引擎返回无关结果（查专有名词返回泛主题页） | 结果相关性过滤：查询 token 加权覆盖率≥0.35 + **ASCII 专有名词必须命中**（分隔符归一，linuxsb↔linux.sb）+ 按相关性重排；规则兜底采集同样过滤 | trace 中 kept/results |
-| 反复搜索同一关键词而不阅读（实测单轮空转 282 次） | 同轮查询去重直接顶回未读链接 + 单轮 12 次搜索预算（282→4 次） | searches / tool_calls |
-| JSON 输出偶尔不合法 | format=json + pydantic 校验 + 失败重试 | json_first_try_rate |
-| 多步规划跑偏 | 四阶段流水线，把规划拆成单次受限生成 | 覆盖率 |
-| 读 1 条就"宣布完成" | min_sources 约束 + nudge 顶回 + 反思补搜 | sources 数 / reflect_rounds |
-| 没有时间概念，"今年/最新"按训练截止期理解 | 每次 LLM 调用注入当前日期（`llm.py`）；"今年/去年"进管线前确定性替换为具体年份 | 搜索词年份 / 报告标题 |
-| 长上下文注意力衰减 | 网页→150字摘要，每节只注入 top-5 相关摘要 | token 用量 |
-| 引用幻觉 | 引用编号白名单校验，写后剔除；评估侧另有忠实度校验兜内容层 | 报告引用合规 / faithfulness、引用密度 |
+**Q：报告里有的节写"（本节暂缺相关资料）"？**
+设计如此（宁缺毋滥）：资料与该节确实无关时不硬写。阶段E 自审会在"占位但有可用资料"时自动补搜+重写，若仍占位说明现有搜索源确实没找到对口资料——换更具体的提问或换搜索源再试。
 
-## 硬件适配实测（RTX 3050 Laptop / 4GB 显存）
+**Q：改了代码 Web UI 行为没变？**
+Python 进程不会热重载，重启 Web 服务（Ctrl+C 后重新 `python -m agent.web`）。
 
-| 模型 | 体积(Q4) | 显存驻留 | 实测单次调用延迟 | 结论 |
-|---|---|---|---|---|
-| qwen2.5:3b | 1.9GB | ✅ 全量进显存 | ~1-2s | 本项目基准配置，40s/报告 |
-| qwen3:4b | 2.5GB | ❌ 溢出到内存，GPU/CPU 反复腾挪 | 3~98s 剧烈波动（真实负载 ~95s） | 不可用：单报告预计 45min+ |
+**Q：一定要联网 / API key 吗？**
+不用。`--provider local` 检索 `data/` 示例语料即可完整体验全流程；联网源（博查/Tavily）才需要 key。
 
-两个附带发现（已写入代码）：
-- 4GB 显存是本项目的硬边界：模型 + KV 缓存 + 显示占用三者合计不能超，qwen3:4b 差一步之遥；
-- ollama 0.32 的 `think=False` 参数会把 Qwen3 思维链错路由进 `content`，官方软开关 `/no_think` 才可靠——`llm.py` 已按模型族自动追加软开关，未来在更大显存机器上切换 qwen3 无需改代码。
+**Q：为什么搜到的是小网站而不是权威来源？**
+搜索质量治理已内置（官方口径提示词 + 权威加权 + 降权 + 黑名单）。若仍遇到，欢迎开 Issue 并附上 trace 文件——这正是全链路留痕的用途。
 
-## Roadmap
+**Q：4GB 显存的入门显卡能跑吗？**
+能，这正是项目的基准环境：qwen2.5:3b（Q4 量化约 1.9GB）可全量驻留 4GB 显存，单次调用 1-2s、约 40s/报告。模型 + KV 缓存 + 显示占用三者合计不超显存即可。
 
-- [x] Web UI：FastAPI + SSE 实时展示 Agent 每一步（`python -m agent.web`）
-- [x] 消融实验（原生 tool call vs 提示词 ReAct / 有无反思 / 朴素基线，见上表）
-- [x] 引用忠实度自动校验（规则层 + LLM 裁决，产出 faithfulness / 引用密度指标）
-- [x] 单元测试 + CI（纯逻辑：JSON 修复、引用校验、路径容错、相关性过滤、忠实度规则层；GitHub Actions）
-- [ ] 写作引用密度提升：3B 写作的引用行为不稳定（0~14%），待提示词迭代
-- [x] 接入博查搜索（国内 AI 搜索，中文召回优于 Tavily，实现 SearchProvider 接口）
+**Q：换 qwen3 这类更新的小模型行不行？**
+显存是硬约束：qwen3:4b（Q4 约 2.5GB）加上 KV 缓存超出 4GB 显存，GPU/CPU 反复腾挪会导致单次调用延迟 3~98s 剧烈波动，实测不可用；显存充裕（8GB+）时改 `.env` 的 `MODEL` 即可尝试。另有一个已写入代码的坑：ollama 0.32 的 `think=False` 参数会把 Qwen3 思维链错路由进正文污染输出，`llm.py` 已按模型族自动改用官方软开关 `/no_think`，换模型无需改代码。
+
+## 贡献
+
+欢迎 Issue 与 PR！提交前请读 [CONTRIBUTING.md](CONTRIBUTING.md)——
+特别是"零框架原则"与"校验降级而非丢弃"两条代码约定。
+
+## License
+
+[MIT](LICENSE)
