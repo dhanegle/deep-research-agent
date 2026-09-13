@@ -9,3 +9,8 @@ eval/results/
 eval/ablation_output.log
 web.log
 .zcode/
+
+# AI 工具会话数据
+.workbuddy-ai/
+.claude/
+
