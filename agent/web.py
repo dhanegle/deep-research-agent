@@ -2,7 +2,7 @@
 
 启动：
     python -m agent.web
-然后浏览器打开 http://127.0.0.1:8000
+然后浏览器打开 http://127.0.0.1:8080
 
 流程：管线在后台线程运行，on_step 事件推入队列；
 SSE 端点把队列内容实时推给浏览器，结束时附带完整报告与运行指标。
@@ -52,6 +52,8 @@ def research(q: str, provider: str | None = None):
                 "report_path": result.report_path,
                 "stats": result.stats,
                 "trace_path": result.trace_path,
+                "evidence_path": result.evidence_path,
+                "quality": result.quality,
             }))
         except Exception as e:  # 管线任意失败都要推给前端并结束流
             events.put(("error", {"message": str(e)[:300]}))
@@ -77,5 +79,5 @@ def research(q: str, provider: str | None = None):
 
 if __name__ == "__main__":
     import uvicorn
-    print("Deep Research Agent Web UI → http://127.0.0.1:8000")
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    print("Deep Research Agent Web UI → http://127.0.0.1:8080")
+    uvicorn.run(app, host="127.0.0.1", port=8080)

@@ -3,22 +3,24 @@
 on_step 回调把每个阶段事件实时抛给 CLI / Web UI 展示。
 """
 import re
+import json
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Callable
 
 from .search import build_provider
 
 from . import config
-from .knowledge import KnowledgeBase
+from .knowledge import KnowledgeBase, source_material
 from .llm import LLM
-from .planner import plan_question
+from .planner import Plan, plan_question
 from .reflector import reflect
 from .researcher import Researcher
 from .reviewer import review_report
 from .stats import RunStats
 from .trace import StepCallback, Trace
-from .writer import _generate_section, _replace_section, _validate_report, iter_report
+from .writer import (add_findings, refresh_references, _dedupe_sections, _generate_section,
+                     _replace_section, _validate_report, iter_report)
 
 
 @dataclass
@@ -29,6 +31,8 @@ class RunResult:
     trace_path: str
     plan: dict
     sources: list  # [{id, url, title, digest}]，引用忠实度校验需要摘要作依据
+    evidence_path: str = ""
+    quality: dict | None = None
 
 
 def _slug(text: str, limit: int = 24) -> str:
@@ -77,8 +81,6 @@ class ResearchPipeline:
 
         # 阶段 C：反思补搜
         for round_i in range(config.MAX_REFLECT_ROUNDS):
-            if len(kb) >= 8:
-                break
             r = reflect(self.llm, question, plan, kb)
             self.stats.reflect_rounds += 1
             self.trace.log("reflect", round=round_i + 1, sufficient=r.sufficient, gaps=r.gap_queries)
@@ -101,7 +103,10 @@ class ResearchPipeline:
             chunks.append(piece)
             if self.on_chunk:
                 self.on_chunk(piece)
-        body = _validate_report("".join(chunks), kb)
+        body, deduped = _dedupe_sections(_validate_report("".join(chunks), kb), question)
+        if deduped:
+            self.stats.deduped_sentences += deduped
+            emit("write", {"status": f"跨节去重：删除 {deduped} 句重复内容"})
 
         # 阶段 E：报告自审+修订（固定 1 轮，对称于阶段 C 的搜-反思）
         review = review_report(self.llm, question, plan, body, kb)
@@ -123,32 +128,62 @@ class ResearchPipeline:
                     researcher.scripted_collect(gaps, per_query_pages=1)
             # E2: 重写有问题的节
             revised = 0
+            handled = set()
             for issue in review.issues:
-                sources = kb.select_for(issue.section, question, k=5)
+                if issue.section in handled or issue.problem == "verification_incomplete":
+                    continue
+                handled.add(issue.section)
+                sources = kb.select_for(issue.section, question, k=3)
                 if not sources:
                     continue
-                material = "\n\n".join(f"[{s.id}] 《{s.title}》\n{s.digest}" for s in sources)
+                material = source_material(sources, f"{question} {issue.section}",
+                                           section=issue.section)
+                feedback = "\n".join(i.detail for i in review.issues if i.section == issue.section)
                 new_body = _generate_section(
-                    self.llm, question, issue.section, material, {s.id for s in sources}
+                    self.llm, question, issue.section, material, {s.id for s in sources},
+                    feedback=feedback[:1500], sources=sources,
                 )
                 body = _replace_section(body, issue.section, new_body)
                 revised += 1
             self.stats.review_revised = revised
-            body = _validate_report(body, kb)
+            # 重写的节可能又复述了别节的内容，去重要再走一遍（幂等，不重复删）
+            body, deduped = _dedupe_sections(
+                _validate_report(refresh_references(body, kb), kb), question)
+            self.stats.deduped_sentences += deduped
+            review = review_report(self.llm, question, plan, body, kb, previous=review)
+            self.stats.review_rounds += 1
             self.trace.log("review_revised", revised=revised)
             emit("review", {"status": f"修订完成，重写 {revised} 节"})
 
+        self.stats.review_unresolved = len(review.issues)
+        self.stats.claims_checked = review.checked_claims
+        self.stats.claims_total = review.total_claims
+        self.stats.quality_status = "no_flags" if review.sufficient else "needs_review"
+        quality = {"status": self.stats.quality_status, **review.model_dump()}
+        self.trace.log("review_final", **quality)
+        emit("review", {"status": "核验完成" if review.sufficient else
+                       f"仍有 {len(review.issues)} 项待核验或资料缺口"})
+        body = add_findings(refresh_references(body, kb), review.claims)
         self.stats.total_seconds = round(time.time() - t0, 1)
         meta = (f"> 模型 `{config.MODEL}` | 来源 {len(kb)} 条 | LLM 调用 {self.stats.llm_calls} 次 | "
                 f"耗时 {self.stats.total_seconds}s | trace `{self.trace.run_id}`")
         title_line, _, rest = body.partition("\n")
-        report = f"{title_line}\n\n{meta}\n{rest}"
+        status = "未发现核验问题" if review.sufficient else f"待核验草稿：{len(review.issues)} 项未解决"
+        quality_note = f"> 核验状态：{status}；已检查 {review.checked_claims}/{review.total_claims} 句。"
+        if review.issues:
+            pending = list(dict.fromkeys(i.section for i in review.issues))
+            quality_note += "\n> 待核验章节：" + "、".join(pending)
+        report = f"{title_line}\n\n{meta}\n\n{quality_note}\n{rest}"
 
         config.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         path = config.REPORTS_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{_slug(question)}.md"
         path.write_text(report, encoding="utf-8")
+        sources = [asdict(s) for s in kb.sources]
+        evidence_path = path.with_suffix(".evidence.json")
+        evidence_path.write_text(json.dumps({
+            "question": question, "plan": plan.model_dump(), "sources": sources, "quality": quality,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
         self.trace.log("run_end", report_path=str(path), stats=self.stats.as_dict())
         emit("finish", {"report_path": str(path), "sources": len(kb)})
-        sources = [{"id": s.id, "url": s.url, "title": s.title, "digest": s.digest} for s in kb.sources]
         return RunResult(str(path), report, self.stats.as_dict(), str(self.trace.path),
-                         plan.model_dump(), sources)
+                         plan.model_dump(), sources, str(evidence_path), quality)

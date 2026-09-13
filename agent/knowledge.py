@@ -6,6 +6,14 @@
 """
 import re
 from dataclasses import dataclass
+from urllib.parse import urlparse
+
+from .evidence import aspect_terms, content_hash, content_terms, evidence_blocks, select_evidence
+from .source_quality import authority_tier
+
+
+def _host(url: str) -> str:
+    return (urlparse(url).hostname or "").lower()
 
 
 def _bigrams(s: str) -> set[str]:
@@ -93,27 +101,50 @@ class Source:
     url: str
     title: str
     digest: str
+    text: str = ""
+    published_at: str = ""
+    publisher: str = ""
+    retrieved_at: str = ""
+    content_hash: str = ""
+
+    @property
+    def evidence(self) -> str:
+        return self.text or self.digest
+
+    def excerpt(self, query: str, max_chars: int = 2400,
+                boost: set[str] | None = None) -> str:
+        return select_evidence(self.evidence, query, max_chars, boost)
 
 
 class KnowledgeBase:
     def __init__(self):
         self.sources: list[Source] = []
         self._by_url: dict[str, int] = {}
+        self._by_content: dict[str, int] = {}
 
     def __len__(self):
         return len(self.sources)
 
-    def add(self, url: str, title: str, digest: str) -> int:
+    def add(self, url: str, title: str, digest: str, *, text: str = "",
+            published_at: str = "", publisher: str = "", retrieved_at: str = "") -> int:
         """按 URL 去重；重复收录返回已有编号。"""
         if url in self._by_url:
             return self._by_url[url]
+        fingerprint = content_hash(text) if text else ""
+        if fingerprint and fingerprint in self._by_content:
+            sid = self._by_content[fingerprint]
+            self._by_url[url] = sid
+            return sid
         sid = len(self.sources) + 1
-        self.sources.append(Source(sid, url, title, digest))
+        self.sources.append(Source(sid, url, title, digest, text, published_at,
+                                   publisher, retrieved_at, fingerprint))
         self._by_url[url] = sid
+        if fingerprint:
+            self._by_content[fingerprint] = sid
         return sid
 
     def _hits(self, source: Source, terms: set[str]) -> int:
-        text = f"{source.title} {source.digest}"
+        text = f"{source.title} {' '.join(evidence_blocks(source.evidence))}".lower()
         return sum(1 for t in terms if t in text)
 
     def relevance(self, source: Source, section: str, question: str) -> int:
@@ -124,36 +155,73 @@ class KnowledgeBase:
 
         4 字窗口用来把「货物贸易」和「贸易伙伴」分开；二元组作次级信号。
         """
-        text = f"{source.title} {source.digest}"
+        text = f"{source.title} {' '.join(evidence_blocks(source.evidence))}"
         w4 = sum(1 for w in _windows4(section) if w in text)
         distinctive = _bigrams(section) - _bigrams(question)
         d2 = sum(1 for t in distinctive if t in text) if distinctive else self._hits(source, _bigrams(section))
         return w4, d2
 
-    def select_for(self, section: str, question: str, k: int = 5) -> list[Source]:
-        """挑选与小节最相关的 k 条来源，始终返回 k 条（库不足时返回全部）。
+    def _title_hits(self, source: Source, terms: set[str]) -> int:
+        return sum(1 for t in terms if t in source.title.lower())
 
-        4 字窗口与区别于问题的二元组只作排序加权，不作入选门槛——
-        实测把窗口当门槛会让每节只剩 1 条素材，3B 模型既要扣题又要带引用
-        难度过高，反而更倾向输出占位符。给足素材让模型有得选更重要。
+    def select_for(self, section: str, question: str, k: int = 5) -> list[Source]:
+        """只选择有小节证据的来源；问题泛词或年份不能替代小节覆盖。
+
+        标题命中排在正文命中之前：正文里的 aspect 命中会被泛词稀释——
+        长文只要出现过一次"趋势"就得分，与专门讲展望的报道同分。标题不会，
+        写明"…形势分析及展望"的来源就是在讲展望（实测：光明网展望专稿
+        与两条排名页同分，靠 id 小被 k 截掉，"未来展望"整节因此占位）。
+
+        标题命中再分两级：小节标题自己的词（"展望"）强于泛同义词（"趋势"）——
+        否则"…及发展趋势"的综述会和展望专稿在标题层继续打平。
+
+        权威分层（本次改造）：权威来源放宽相关性门槛（sec_hits≥1 即可），
+        并在排序里高于普通站点。理由：央媒/部委用编辑措辞（"规模预计1270万人"），
+        字面命中天然低于照抄查询词的聚合站——实测「毕业总人数预测」一节，
+        人民网/新华网 sec_hits=1 被门槛整条挡掉，而标题写"数据错得离谱"的
+        自媒体 sec_hits=4 入选，报告最终引用了错误的 1250 万而非权威的 1270 万。
+        相关性仍由 w4（小节 4 字窗口）作首要信号，权威只在同层级内优先。
         """
-        sec_terms = _bigrams(section)
+        sec_terms = content_terms(section)
+        if not sec_terms:
+            sec_terms = content_terms(question)
+        aspects = aspect_terms(section)
+        # 小节区别于问题的二元组才有判别力：问题词每条来源都有。
+        distinctive = _bigrams(section) - _bigrams(question) or _bigrams(section)
+        need = min(2, len(sec_terms))
         scored = []
         for s in self.sources:
+            tier = authority_tier(_host(s.url))
             w4, d2 = self.section_match(s, section, question)
             sec_hits = self._hits(s, sec_terms)
-            scored.append((w4, d2, sec_hits, s.id, s))
-        scored.sort(key=lambda x: (-x[0], -x[1], -x[2], x[3]))
+            topic_hits = self._hits(s, content_terms(question))
+            aspect_hits = self._hits(s, aspects)
+            relevant = (sec_hits >= need
+                        or (topic_hits >= 2 and aspect_hits > 0)
+                        or (tier > 0 and sec_hits >= 1))
+            if not sec_terms or not relevant:
+                continue
+            title_own = self._title_hits(s, distinctive)
+            title_aspect = self._title_hits(s, aspects - distinctive)
+            scored.append((w4, tier, title_own, title_aspect, aspect_hits, sec_hits, s.id, s))
+        scored.sort(key=lambda x: (-x[0], -x[1], -x[2], -x[3], -x[4], -x[5], x[6]))
         return [s for *_, s in scored[:k]]
 
     def has_section_material(self, section: str) -> bool:
         """是否存在与小节标题直接相关的来源（仅用小节自身二元组判断）。"""
-        terms = _bigrams(section)
-        if not terms:
-            return bool(self.sources)
-        return any(self._hits(s, terms) > 0 for s in self.sources)
+        return bool(self.select_for(section, "", k=1))
 
     def coverage(self, section: str, question: str, threshold: int = 3) -> int:
         """与小节有实质相关性的来源数；反思阶段的规则兜底依据。"""
-        terms = _bigrams(section) | _bigrams(question)
-        return sum(1 for s in self.sources if self._hits(s, terms) >= threshold)
+        return len(self.select_for(section, question, k=len(self.sources)))
+
+
+def source_material(sources: list[Source], query: str, max_chars: int = 1800,
+                    section: str = "") -> str:
+    """section 给出后，该节的特征词在片段筛选中加权（见 select_evidence）。"""
+    boost = (content_terms(section) | aspect_terms(section)) if section else None
+    return "\n\n".join(
+        f"[{s.id}] 《{s.title}》\n发布机构：{s.publisher or '未标明'}；"
+        f"发布日期：{s.published_at or '未标明'}（不是数据所属期间）\n"
+        f"原文证据：\n{s.excerpt(query, max_chars, boost)}" for s in sources
+    )

@@ -4,12 +4,31 @@
 参数命名 url→path + 容错匹配曾把同一任务的工具有效率从 39% 拉到 100%。
 测试锁定该行为。
 """
-from agent.researcher import Researcher, _strip_question_verbs
+from agent.researcher import Researcher, _date_tag, _strip_question_verbs
 from agent.search.base import SearchResult
 
 
 def _seen(*urls):
     return {u: f"标题{i}" for i, u in enumerate(urls)}
+
+
+class _Trace:
+    """最小 trace 桩：_filter_results 会记录被拒收的单位内部页。"""
+
+    def __init__(self):
+        self.events = []
+
+    def log(self, event, **data):
+        self.events.append((event, data))
+
+
+def _bare(**attrs):
+    """裸实例：绕过 __init__，只挂上被测方法真正用到的属性。"""
+    r = Researcher.__new__(Researcher)
+    r.trace = _Trace()
+    for k, v in attrs.items():
+        setattr(r, k, v)
+    return r
 
 
 class TestResolvePath:
@@ -46,13 +65,12 @@ class TestResolvePath:
 
 
 def _filter(query, results, question=None):
-    r = Researcher.__new__(Researcher)
-    r._question = question or query
+    r = _bare(_question=question or query)
     return r._filter_results(results, query)
 
 
 def _anchor(query, question):
-    r = Researcher.__new__(Researcher)
+    r = _bare()
     r._core = _strip_question_verbs(question)[:14]
     return r._anchor_query(query)
 
@@ -112,6 +130,26 @@ class TestFilterResults:
         assert kept == []
 
 
+class TestFailedUrlTracking:
+    """抓取失败/被拒收的 URL 跨轮拉黑：反爬 412 页面反复出现在补搜结果里，
+    不拉黑会让每轮补搜都在同一批死链上空转（实测 13 次搜索零收录）。"""
+
+    def test_failed_url_dropped_from_results(self):
+        r = _bare(_question="2026年我国的出口情况",
+                  _failed_urls={"https://customs.example.com/blocked"})
+        results = [
+            SearchResult("海关总署出口统计", "https://customs.example.com/blocked", "2026年出口总值统计"),
+            SearchResult("出口总值再创新高", "https://news.example.com/ok", "2026年我国出口情况"),
+        ]
+        kept = r._filter_results(results, "2026年出口总值")
+        assert [x.url for x in kept] == ["https://news.example.com/ok"]
+
+    def test_no_failed_set_keeps_all(self):
+        # __new__ 构造的裸实例没有 _failed_urls 属性时不报错、不误删
+        results = [SearchResult("出口总值再创新高", "u1", "2026年我国出口情况")]
+        assert [x.url for x in _filter("2026年出口总值", results, "2026年我国的出口情况")] == ["u1"]
+
+
 class TestAnchorQuery:
     """大纲空词兜底改写：小节标题原样当搜索词会被题库站字面命中。"""
 
@@ -162,8 +200,9 @@ class TestAuthorityAndBlocklist:
         kept = _filter("毕业生就业数据", results, question="2026年的毕业情况")
         assert kept[0].url == "https://www.moe.gov.cn/b"
 
-    def test_demotes_school_internal_notice(self):
-        # 教育话题：学校公示页与官方统计报道字面相关度接近时，公示页降权排后
+    def test_drops_school_internal_notice(self):
+        # 学校公示页整条拒收：正文只有名单，没有任何统计口径，
+        # 字面密度却很高，只降权会让它继续占着候选位（实测被收录 3 次）
         results = [
             SearchResult("2026届毕业生毕业资格及学位授予资格审查结果公示",
                          "https://jiaowuchu.xcu.edu.cn/info/1.html",
@@ -173,10 +212,10 @@ class TestAuthorityAndBlocklist:
                          "教育部发布 2026届全国普通高校毕业生规模 1270万人"),
         ]
         kept = _filter("2026年毕业生人数规模", results, question="调研2026年的毕业情况")
-        assert kept[0].url == "https://news.example.com/guojia"
+        assert [x.url for x in kept] == ["https://news.example.com/guojia"]
 
-    def test_gov_notice_not_demoted(self):
-        # 权威域的「通知」是部委文件，恰恰是最佳来源——不受内部页面降权影响
+    def test_gov_notice_kept(self):
+        # 权威域的「通知」是部委文件，恰恰是最佳来源——不参与内部页拒收
         results = [
             SearchResult("关于做好2026届全国高校毕业生就业创业工作的通知",
                          "https://www.moe.gov.cn/srcsite/A17/notice.html",
@@ -186,8 +225,8 @@ class TestAuthorityAndBlocklist:
         kept = _filter("毕业生就业通知", results, question="2026年的毕业情况")
         assert kept[0].url == "https://www.moe.gov.cn/srcsite/A17/notice.html"
 
-    def test_demotes_non_edu_internal_page(self):
-        # 非教育话题同样成立：公司放假通知压不过行业统计报道
+    def test_drops_non_edu_internal_page(self):
+        # 非教育话题同样成立：公司放假通知与调研无关，直接丢弃
         results = [
             SearchResult("关于2026年春节放假安排的通知", "https://hr.example.com/notice1",
                          "2026年春节 放假 通知 安排"),
@@ -195,4 +234,86 @@ class TestAuthorityAndBlocklist:
                          "2026年春节 全国消费 消费数据"),
         ]
         kept = _filter("2026年春节消费数据", results, question="2026年春节消费情况如何")
-        assert kept[0].url == "https://news.example.com/c"
+        assert [x.url for x in kept] == ["https://news.example.com/c"]
+
+    def test_internal_page_drop_is_traced(self):
+        # 拒收要留痕：否则线上只能看到"搜到了却没收录"，无法归因
+        results = [
+            SearchResult("关于2026年春节放假安排的通知", "https://hr.example.com/notice1",
+                         "2026年春节 放假 通知 安排"),
+        ]
+        r = _bare(_question="2026年春节消费情况如何")
+        assert r._filter_results(results, "2026年春节消费数据") == []
+        assert any(e == "internal_page_dropped" for e, _ in r.trace.events)
+
+
+class TestFreshnessPreference:
+    """时效偏好：搜索结果此前不带日期，排序没有时间维度。
+
+    实测候选里 2026 年 546 条、2025 年 102 条、2024 年及更早 50 条，
+    旧稿与新闻同权，旧稿还常因是央媒排得更前。
+    设计为**只奖新鲜、不罚旧**——见 test_old_and_unknown_treated_alike。
+    """
+
+    def test_fresher_wins_when_equally_relevant(self):
+        results = [
+            SearchResult("2026年毕业生就业数据分析", "https://news.example.com/old",
+                         "2026年毕业生就业数据 分析", published_at="2024-01-01"),
+            SearchResult("2026年毕业生就业数据分析", "https://news.example.com/new",
+                         "2026年毕业生就业数据 分析", published_at="2026-08-01"),
+        ]
+        kept = _filter("2026年毕业生就业数据", results, question="2026年的毕业情况")
+        assert kept[0].url == "https://news.example.com/new"
+
+    def test_authority_not_displaced_by_freshness(self):
+        # 离线回放发现的回归：若时效惩罚旧内容，新普通站会挤掉旧权威。
+        # 权威分层必须优先于时效。
+        results = [
+            SearchResult("2026年毕业生就业数据发布", "https://www.moe.gov.cn/a",
+                         "2026年毕业生就业数据发布", published_at="2025-11-20"),
+            SearchResult("2026年毕业生就业数据解读", "https://news.example.com/b",
+                         "2026年毕业生就业数据解读", published_at="2026-09-01"),
+        ]
+        kept = _filter("2026年毕业生就业数据", results, question="2026年的毕业情况")
+        assert kept[0].url == "https://www.moe.gov.cn/a"
+
+    def test_old_and_unknown_treated_alike(self, monkeypatch):
+        # 旧内容与日期未知都不获奖，因此时效开关不应改变两者的相对顺序。
+        # 这是"只奖不罚"的关键性质：否则未知日期的政府来源会反超旧权威。
+        from agent import config
+
+        results = [
+            SearchResult("2026年毕业生就业数据分析", "https://news.example.com/old",
+                         "2026年毕业生就业数据 分析", published_at="2024-01-01"),
+            SearchResult("2026年毕业生就业数据分析", "https://news.example.com/nodate",
+                         "2026年毕业生就业数据 分析"),
+        ]
+        on = [x.url for x in _filter("2026年毕业生就业数据", results,
+                                     question="2026年的毕业情况")]
+        monkeypatch.setattr(config, "FRESH_DAYS", 0)
+        off = [x.url for x in _filter("2026年毕业生就业数据", results,
+                                      question="2026年的毕业情况")]
+        assert on == off
+
+    def test_disabled_still_keeps_all(self, monkeypatch):
+        from agent import config
+        monkeypatch.setattr(config, "FRESH_DAYS", 0)
+        results = [
+            SearchResult("2026年毕业生就业数据分析", "https://news.example.com/old",
+                         "2026年毕业生就业数据 分析", published_at="2025-01-01"),
+            SearchResult("2026年毕业生就业数据分析", "https://news.example.com/new",
+                         "2026年毕业生就业数据 分析", published_at="2026-08-01"),
+        ]
+        kept = _filter("2026年毕业生就业数据", results, question="2026年的毕业情况")
+        assert len(kept) == 2
+
+
+class TestDateTag:
+    def test_tag_rendered(self):
+        assert _date_tag("2026-06-30") == "（2026-06-30）"
+
+    def test_unknown_date_not_fabricated(self):
+        assert _date_tag("") == ""
+
+    def test_search_result_defaults_to_no_date(self):
+        assert SearchResult("标题", "https://x.com/a", "摘要").published_at == ""

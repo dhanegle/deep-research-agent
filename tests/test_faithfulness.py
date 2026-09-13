@@ -36,8 +36,8 @@ class TestMissingNumbers:
         assert missing_numbers("出口107万辆[1]", "出口107万辆", "") == []
 
     def test_number_in_question(self):
-        # 题目自带的年份不算存疑
-        assert missing_numbers("2025年情况[1]", "摘要无年份", "2025年出口情况") == []
+        # 用户的问题不能为事实提供证据。
+        assert missing_numbers("2025年情况[1]", "摘要无年份", "2025年出口情况") == ["2025"]
 
     def test_rounded_tolerance(self):
         # 来源 106.9 万，句子写"约107万" → 四舍五入容差，不算存疑

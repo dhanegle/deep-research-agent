@@ -105,25 +105,21 @@ class TestKnowledgeBaseSelect:
 
     def test_drops_zero_section_overlap(self):
         kb = self._kb()
-        # 「量子计算」与两条来源都无小节重合 → 库不足 k 条时仍返回，但排在最末
-        # （不再用门槛剔除——给足素材比严卡门槛更重要）
+        # 资料不足也不以无关来源补足 k。
         selected = kb.select_for("量子计算", "固态电池产业化", k=5)
-        assert len(selected) == 2  # 库只有 2 条，全部返回
-        # 与小节相关的应排在前面；这里两条都不相关，顺序按原 id
-        assert selected[0].title == "固态电池量产进展"
+        assert selected == []
 
     def test_question_overlap_alone_not_enough(self):
-        # 来源对上了问题词（linuxdo/社区）但对不上小节标题 → 不优先，但库不足时仍返回
+        # 只对上问题词，不足以支持“活跃成员”这个小节。
         kb = KnowledgeBase()
         kb.add("u1", "linuxdo 邀请码获取", "填写50字申请即可加入社区")
         selected = kb.select_for("活跃成员", "linuxdo是什么社区", k=5)
-        assert len(selected) == 1  # 库只有 1 条，返回它
+        assert selected == []
 
     def test_keeps_only_section_relevant(self):
         kb = self._kb()
         selected = kb.select_for("固态电池", "固态电池产业化", k=5)
-        assert [s.title for s in selected] == ["固态电池量产进展", "欧洲旅游攻略"]
-        # 相关的排在前，不相关的在后（不再剔除）
+        assert [s.title for s in selected] == ["固态电池量产进展"]
 
     def test_prefers_section_4gram_over_generic_word(self):
         kb = KnowledgeBase()
@@ -132,7 +128,61 @@ class TestKnowledgeBaseSelect:
         selected = kb.select_for("贸易伙伴分析", "2026年我国的出口情况", k=5)
         assert selected[0].title == "中国前十二大贸易伙伴"
 
+    def test_aspect_fallback_selects_structure_source(self):
+        # 实测缺口：「商品结构与特点」的对口来源只命中标题二元组"结构"一个，
+        # 旧 aspect 表没有商品/结构组，兜底条件不成立被整个排除
+        kb = KnowledgeBase()
+        kb.add("u1", "2026年中国外贸市场分析", "2026年上半年我国进出口总值25.47万亿元，高技术产品出口增长，外贸结构优化升级")
+        selected = kb.select_for("商品结构与特点", "2026年我国进出口情况", k=5)
+        assert [s.title for s in selected] == ["2026年中国外贸市场分析"]
+        # 无关来源仍进不来：aspect 命中但问题词不足两个
+        kb2 = KnowledgeBase()
+        kb2.add("u2", "家居产品选购指南", "沙发与床垫的品类结构对比")
+        assert kb2.select_for("商品结构与特点", "2026年我国进出口情况", k=5) == []
+
+    def test_title_hit_outranks_diluted_body_aspect(self):
+        # 实测缺口：「未来展望」节里，标题写明“展望”的光明网专稿与两条排名页
+        # 同分（正文各偶然出现一次“趋势/预计”），靠 id 小被 k=2 截掉，整节占位。
+        # 标题命中不会被长正文稀释，应排在正文 aspect 命中之前。
+        kb = KnowledgeBase()
+        kb.add("u1", "全国进出口贸易额及各国排名", "2026年进出口排名。" + "行业预计保持增长，趋势向好。" * 40)
+        kb.add("u2", "中国外贸市场分析及发展趋势", "2026年我国进出口规模扩大。" + "未来趋势值得关注。" * 40)
+        kb.add("u3", "2026年我国贸易形势分析及展望", "我国进出口全年有望保持增长，出口结构持续改善。")
+        selected = kb.select_for("未来展望", "2026年我国进出口情况", k=2)
+        assert "展望" in selected[0].title
+
     def test_has_section_material(self):
         kb = self._kb()
         assert kb.has_section_material("固态电池") is True
         assert kb.has_section_material("量子计算") is False
+
+
+class TestSelectPrefersAuthority:
+    """写作选材的权威优先：实测「毕业总人数预测」一节把人民网/新华网挡在门外，
+    报告因此引用了自媒体的错误数字（1250 万）而非权威的 1270 万。"""
+
+    def test_authority_gate_relaxed(self):
+        # 权威媒体用编辑措辞（"规模预计1270万人"），字面命中低于照抄查询词的聚合站，
+        # 门槛对权威放宽到 sec_hits>=1
+        kb = KnowledgeBase()
+        kb.add("https://edu.people.com.cn/n1/2025/1121/c.html",
+               "2026届全国高校毕业生规模预计1270万人 - 人民网教育",
+               "2026届全国高校毕业生规模预计1270万人，同比增加48万人。")
+        kb.add("https://view.inews.qq.com/a/2025",
+               "明年大学毕业生的人数比今年跳涨371万？这张图表数据错得离谱",
+               "大学毕业生的人数 毕业生人数 数据")
+        titles = [s.title for s in kb.select_for("毕业总人数预测", "2026年的毕业情况", k=3)]
+        assert any("人民网" in t for t in titles)
+
+    def test_authority_outranks_ordinary_when_comparable(self):
+        kb = KnowledgeBase()
+        kb.add("https://www.sohu.com/a/1", "2026年毕业生就业数据报告", "毕业生就业数据 分析")
+        kb.add("https://www.news.cn/2025/x.html", "2026届高校毕业生就业数据发布", "毕业生就业数据发布")
+        selected = kb.select_for("就业数据", "2026年毕业生就业情况", k=5)
+        assert selected[0].title.startswith("2026届高校毕业生就业数据发布")
+
+    def test_ordinary_sources_still_gated(self):
+        # 门槛放宽只对权威生效：普通来源仍须满足原有相关性要求
+        kb = KnowledgeBase()
+        kb.add("https://www.gzchanjiao.com/a", "某培训机构就业分析", "毕业生就业情况概述")
+        assert kb.select_for("量子计算", "2026年的毕业情况", k=5) == []

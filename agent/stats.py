@@ -13,12 +13,19 @@ class RunStats:
     tool_invalid: int = 0        # 其中非法（未知工具/缺参数/编造链接）的次数
     react_fallbacks: int = 0     # 原生 tool call 连续失败后降级 JSON-ReAct 的步数
     searches: int = 0
+    authority_searches: int = 0   # 其中权威定向检索（权威域名白名单内）的次数
     pages_fetched: int = 0
+    pages_rejected: int = 0
     digest_calls: int = 0
     reflect_rounds: int = 0
     review_rounds: int = 0      # 报告自审轮次（0 或 1）
     review_issues: int = 0     # 自审发现的问题数
     review_revised: int = 0     # 自审实际重写的节数
+    review_unresolved: int = 0
+    deduped_sentences: int = 0  # 成文后跨节去重删除的重复句数
+    claims_checked: int = 0
+    claims_total: int = 0
+    quality_status: str = "pending"
     total_seconds: float = 0.0
 
     @property

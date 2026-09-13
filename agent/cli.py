@@ -31,7 +31,10 @@ def _on_step(console: Console):
             state = "资料充分" if data["sufficient"] else f"存在缺口 → 补搜 {data['gap_queries']}"
             console.print(f"[magenta]🤔 反思(第{data['round']}轮)[/magenta] {state}")
         elif event == "write":
-            console.print(f"[blue]✍️  {data['status']}[/blue] 小节：{ '、'.join(data['sections']) }")
+            # 小节列表是可选字段：写作阶段还会推"跨节去重"这类无小节的状态事件
+            sections = data.get("sections")
+            console.print(f"[blue]✍️  {data['status']}[/blue]"
+                          + (f" 小节：{'、'.join(sections)}" if sections else ""))
         elif event == "finish":
             console.print(f"[bold green]✅ 报告已生成：{data['report_path']}[/bold green]（来源 {data['sources']} 条）")
     return emit

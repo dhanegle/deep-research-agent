@@ -80,7 +80,8 @@ class LLM:
         self.client = Client(host=config.OLLAMA_HOST, timeout=config.LLM_TIMEOUT)
 
     # ---- 基础调用 -------------------------------------------------------
-    def _chat(self, messages: list[dict], tools: list | None = None, json_mode: bool = False) -> dict:
+    def _chat(self, messages: list[dict], tools: list | None = None, json_mode: bool = False,
+              json_schema: dict | None = None) -> dict:
         messages = _with_clock(messages)
         if _no_think_needed():
             messages = _append_no_think(messages)
@@ -92,7 +93,7 @@ class LLM:
         if tools:
             kwargs["tools"] = tools
         if json_mode:
-            kwargs["format"] = "json"
+            kwargs["format"] = json_schema or "json"
         if config.THINK_MODE.lower() == "on":
             kwargs["think"] = True
         t0 = time.time()
@@ -178,7 +179,7 @@ class LLM:
         last_err = "unknown"
         for attempt in range(3):
             try:
-                text = (self._chat(conv, json_mode=True).get("content") or "").strip()
+                text = (self._chat(conv, json_mode=True, json_schema=schema.model_json_schema()).get("content") or "").strip()
                 model = schema.model_validate_json(extract_json(text))
                 if attempt == 0:
                     self.stats.json_first_try_ok += 1

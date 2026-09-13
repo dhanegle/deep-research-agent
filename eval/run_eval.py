@@ -64,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
                 "id": task["id"], "ok": True,
                 "coverage": coverage(run.report, task["must_cover"]),
                 "stats": run.stats, "report_path": run.report_path,
+                "quality": run.quality or {}, "evidence_path": run.evidence_path,
             }
             if not args.no_faith:
                 # 校验用的 LLM 调用发生在 stats 快照之后，不计入该任务的统计
@@ -84,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
             console.print(line + f"，数字存疑 {faith['num_flagged']} 句）"
                           + f"  引用密度 {faith['citation_density']*100:.0f}%"
                           f"（{faith['cited_sentences']}/{faith['sentences']} 句带引用）")
+            console.print(f"  核验范围：{faith['judged']}/{faith['sentences']} 句；忠实度仅针对已判定句")
         results.append(row)
 
     summary = aggregate(results)

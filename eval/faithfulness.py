@@ -26,15 +26,20 @@ from agent.factcheck import (
     CITE_RE, NUM_RE, MAX_JUDGES,
     _iter_sentences, cited_sentences, missing_numbers, judge,
 )
+from agent.evidence import select_evidence
 
 
 def check_report(llm, report: str, question: str, sources: list[dict],
                  max_judges: int = MAX_JUDGES) -> dict:
     """入口：report 为生成的 Markdown，sources 为 [{id, digest}, ...]。"""
-    by_id = {s["id"]: s["digest"] for s in sources}
+    by_id = {s["id"]: s.get("text") or s["digest"] for s in sources}
     items = []
+    seen = set()
     for sent, ids in cited_sentences(report):
-        digests = [by_id[i] for i in ids if i in by_id]
+        if sent in seen:
+            continue
+        seen.add(sent)
+        digests = [select_evidence(by_id[i], sent, 1800) for i in ids if i in by_id]
         if not digests:
             continue
         items.append({
@@ -47,20 +52,22 @@ def check_report(llm, report: str, question: str, sources: list[dict],
     counts = {"支持": 0, "部分支持": 0, "不支持": 0}
     unjudged = 0
     for it in chosen:
-        digest = " ".join(by_id[i] for i in it["ids"] if i in by_id)
-        verdict = judge(llm, it["sentence"], digest)
+        digest = " ".join(select_evidence(by_id[i], it["sentence"], 1800) for i in it["ids"] if i in by_id)
+        verdict = "不支持" if it["num_flags"] else judge(llm, it["sentence"], digest)
         it["verdict"] = verdict
         if verdict is None:
             unjudged += 1
         else:
             counts[verdict] += 1
     judged = sum(counts.values())
-    total = len(list(_iter_sentences(report)))
+    total = len(set(_iter_sentences(report)))
     return {
         "sentences": total,
         "citation_density": round(len(items) / total, 3) if total else None,
         "cited_sentences": len(items),
         "judged": judged,
+        "judgment_coverage": round(judged / total, 3) if total else None,
+        "supported_sentence_rate": round(counts["支持"] / total, 3) if total else None,
         "unjudged": unjudged,
         "supported": counts["支持"],
         "partial": counts["部分支持"],

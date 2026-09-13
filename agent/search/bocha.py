@@ -6,6 +6,7 @@
 import httpx
 
 from .. import config
+from ..dates import normalize
 from .base import SearchProvider, SearchResult
 from .cache import DiskCache
 
@@ -19,22 +20,27 @@ class BochaProvider(SearchProvider):
         self.api_key = api_key
         self.cache = DiskCache("search")
 
-    def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
+    def search(self, query: str, max_results: int = 5,
+               include_domains: list[str] | None = None) -> list[SearchResult]:
         key = f"bocha:v2:{query}:{max_results}"
+        if include_domains:  # 域名白名单进入缓存键，避免与普通检索互相覆盖
+            key += "|d=" + ",".join(sorted(include_domains))
         cached = self.cache.get(key)
         if cached is not None:
             return [SearchResult(**r) for r in cached]
+        payload: dict = {"query": query, "count": max_results, "summary": True}
+        if include_domains:
+            # 博查的域名过滤参数名是 include（"|" 分隔，最多 100 个）。
+            # 实测：支持具体站点及其子域（moe.gov.cn → www.moe.gov.cn），
+            # 但不支持泛域 "gov.cn"（返回 0 条）——白名单须逐个枚举。
+            payload["include"] = "|".join(include_domains)
         resp = httpx.post(
             self.API,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            json={
-                "query": query,
-                "count": max_results,
-                "summary": True,
-            },
+            json=payload,
             timeout=20,
             trust_env=config.USE_SYSTEM_PROXY,
         )
@@ -56,6 +62,9 @@ class BochaProvider(SearchProvider):
                 title=str(r.get("name", ""))[:120],
                 url=r["url"],
                 snippet=text[:800],
+                # 博查的 datePublished 是 ISO 8601（实测覆盖率 100%），
+                # 此前被丢弃；取不到时由 SearchResult 退回 URL 内嵌日期。
+                published_at=normalize(str(r.get("datePublished") or "")),
             ))
         self.cache.put(key, [vars(r) for r in results])
         return results

@@ -1,17 +1,11 @@
-"""阶段 E：报告自审（对称于阶段 C 的反思补搜）。
-
-把「报告质量是否过关」这类开放判断降级为受限输出（sufficient 布尔 + 问题清单），
-并用规则层兜底：占位节有可用来源、零引用节、数字存疑等先免费扫一遍，
-再让 LLM 做一次结构审查确认，最后对存疑节逐句裁决。
-
-三阶段成本递增，前阶段不命中则后续不触发：
-① 规则层（免费）→ ② LLM 结构审查（1 次）→ ③ 逐句忠实度（3-6 次，仅存疑节）
-"""
+"""按原文证据审查报告；规则问题、未核验句和资料缺口都保留到最终状态。"""
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
-from .factcheck import CITE_RE, cited_sentences, missing_numbers, judge
+from . import config
+from .evidence import content_hash
+from .factcheck import CITE_RE, _iter_sentences, missing_numbers, judge, unsupported_citations
 from .knowledge import KnowledgeBase
 from .llm import LLM
 from .planner import Plan
@@ -19,76 +13,28 @@ from .planner import Plan
 
 class SectionIssue(BaseModel):
     section: str
-    problem: Literal["placeholder_fillable", "no_citation", "faithfulness_suspect"]
+    problem: Literal["placeholder_fillable", "missing_evidence", "no_citation",
+                     "faithfulness_suspect", "verification_incomplete"]
     detail: str = ""
     gap_query: str = ""
 
-    @field_validator("gap_query")
-    @classmethod
-    def _clean_gap(cls, v: str) -> str:
-        return v.strip()[:60]
-
 
 class Review(BaseModel):
-    """对称于 reflector.Reflection：sufficient + issues。"""
     sufficient: bool
-    issues: list[SectionIssue] = Field(default_factory=list, max_length=10)
+    issues: list[SectionIssue] = Field(default_factory=list)
+    checked_claims: int = 0
+    total_claims: int = 0
+    claims: list[dict] = Field(default_factory=list)
 
     @property
     def gap_queries(self) -> list[str]:
-        return [i.gap_query for i in self.issues
-                if i.problem == "placeholder_fillable" and i.gap_query]
-
-
-SYSTEM_PROMPT = """\
-你是报告质量审查员，判断报告各节是否存在问题。
-只输出 JSON：{"sufficient": true或false, "issues": [{"section":"节标题", "problem":"问题类型", "detail":"简述", "gap_query":"搜索词"}]}
-问题类型三选一：
-- placeholder_fillable：该节为"（本节暂缺相关资料）"但有可用资料可补——必须在 gap_query 给出搜索词（含主题关键词，≤15字，单一主题）
-- no_citation：该节有实质内容但没有任何 [n] 引用标记
-- faithfulness_suspect：该节数字或事实可能与来源不符（规则层已标记可疑数字）
-判定标准：无占位节、无零引用节、无存疑句时 sufficient 为 true。
-"""
-
-
-def _rule_layer(report: str, question: str, plan: Plan, kb: KnowledgeBase) -> list[SectionIssue]:
-    """① 规则层（零成本）：占位节查可补、零引用节查缺失、数字查存疑。"""
-    issues: list[SectionIssue] = []
-    sections = _split_report_sections(report)
-
-    for sec, body in sections.items():
-        if sec not in plan.outline:
-            continue
-        # 占位节：有可用来源才标记可补
-        if "暂缺" in body and kb.has_section_material(sec):
-            issues.append(SectionIssue(
-                section=sec, problem="placeholder_fillable",
-                detail="占位节但有可用资料",
-            ))
-            continue
-        # 零引用节：有实质内容却无引用
-        if "暂缺" not in body and body.strip() and not CITE_RE.search(body):
-            issues.append(SectionIssue(
-                section=sec, problem="no_citation",
-                detail="有内容但无引用标记",
-            ))
-        # 数字存疑：句子里的数字不在被引来源摘要里
-        for sent, ids in cited_sentences(body):
-            digests = " ".join(
-                kb.sources[i - 1].digest for i in ids if 1 <= i <= len(kb.sources)
-            )
-            flagged = missing_numbers(sent, digests, question)
-            if flagged:
-                issues.append(SectionIssue(
-                    section=sec, problem="faithfulness_suspect",
-                    detail=f"存疑数字：{','.join(flagged[:3])}",
-                ))
-                break
-    return issues
+        return list(dict.fromkeys(
+            i.gap_query for i in self.issues
+            if i.problem in {"placeholder_fillable", "missing_evidence"} and i.gap_query
+        ))[:2]
 
 
 def _split_report_sections(report: str) -> dict[str, str]:
-    """把报告按 ## 标题切成 {标题: 正文}，跳过 # 主标题和 ## 参考来源。"""
     sections: dict[str, str] = {}
     current_title = ""
     current_body: list[str] = []
@@ -107,64 +53,107 @@ def _split_report_sections(report: str) -> dict[str, str]:
     return sections
 
 
-def review_report(llm: LLM, question: str, plan: Plan, report: str,
-                  kb: KnowledgeBase) -> Review:
-    """报告自审入口：规则层 → LLM 结构审查 → 存疑节逐句裁决。"""
-    # ① 规则层
-    rule_issues = _rule_layer(report, question, plan, kb)
+def _claims(body: str):
+    for sent in _iter_sentences(body):
+        if "暂缺" in sent and len(sent) < 60:
+            continue
+        if len(sent) >= 10 or CITE_RE.search(sent):
+            yield sent, sorted({int(i) for i in CITE_RE.findall(sent)})
 
-    # ② LLM 结构审查（1 次 chat_json）
-    sections = _split_report_sections(report)
-    section_summaries = "\n".join(
-        f"### {sec}\n{sections.get(sec, '（未生成）')[:200]}" for sec in plan.outline
-    )
-    rule_hints = "\n".join(
-        f"- {i.section}：{i.problem}（{i.detail}）" for i in rule_issues
-    ) or "（规则层未发现问题）"
-    try:
-        review = llm.chat_json([
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": (
-                f"调研问题：{question}\n报告大纲：{'；'.join(plan.outline)}\n"
-                f"各节正文摘要：\n{section_summaries}\n\n"
-                f"规则层标记：\n{rule_hints}"
-            )},
-        ], Review, tag="reviewer")
-    except ValueError:
-        # LLM 审查失败：回退到仅规则层结果
-        return Review(sufficient=not rule_issues, issues=rule_issues)
 
-    # ③ 逐句忠实度裁决：仅对 faithfulness_suspect 的节，限 3-6 句
-    suspect_sections = {i.section for i in review.issues
-                        if i.problem == "faithfulness_suspect"}
-    if suspect_sections:
-        by_id = {s.id: s for s in kb.sources}
-        confirmed: list[SectionIssue] = []
-        for issue in list(review.issues):
-            if issue.problem != "faithfulness_suspect":
-                confirmed.append(issue)
+def _evidence_by_id(kb: KnowledgeBase, sent: str, ids: list[int]) -> dict[int, str]:
+    by_id = {s.id: s for s in kb.sources}
+    return {i: by_id[i].excerpt(sent, 1800) for i in ids if i in by_id}
+
+
+def _evidence(kb: KnowledgeBase, sent: str, ids: list[int]) -> str:
+    return "\n\n".join(f"[{i}] {ev}" for i, ev in _evidence_by_id(kb, sent, ids).items())
+
+
+def _rule_layer(report: str, question: str, plan: Plan, kb: KnowledgeBase) -> list[SectionIssue]:
+    issues = []
+    by_id = {s.id: s for s in kb.sources}
+    for sec, body in _split_report_sections(report).items():
+        if sec not in plan.outline:
+            continue
+        if not body or ("暂缺" in body and len(body) < 70):
+            fillable = bool(kb.select_for(sec, question, k=1))
+            issues.append(SectionIssue(
+                section=sec, problem="placeholder_fillable" if fillable else "missing_evidence",
+                detail="本节缺少可用证据", gap_query=f"{question} {sec}"[:60],
+            ))
+            continue
+        for sent, ids in _claims(body):
+            if not ids or any(i not in by_id for i in ids):
+                issues.append(SectionIssue(section=sec, problem="no_citation",
+                                           detail=f"缺少有效引用：{sent[:100]}"))
                 continue
-            body = sections.get(issue.section, "")
-            judged = 0
-            refuted = False
-            for sent, ids in cited_sentences(body):
-                if judged >= 4:
-                    break
-                digests = " ".join(
-                    by_id[i].digest for i in ids if i in by_id
-                )
-                if not digests:
-                    continue
-                verdict = judge(llm, sent, digests)
-                judged += 1
-                if verdict == "不支持":
-                    refuted = True
-                    issue.detail = f"裁决不支持：{sent[:40]}"
-                    break
-            if refuted:
-                confirmed.append(issue)
-            # 裁决通过则丢弃该存疑标记（不冤枉）
-        review.issues = confirmed
+            per_id = _evidence_by_id(kb, sent, ids)
+            flagged = missing_numbers(sent, _evidence(kb, sent, ids), question)
+            if flagged:
+                issues.append(SectionIssue(
+                    section=sec, problem="faithfulness_suspect",
+                    detail=f"原文不支持数值、单位或期间 {','.join(flagged)}：{sent[:100]}",
+                ))
+                continue
+            extra = unsupported_citations(sent, per_id, question)
+            if extra:
+                marks = "".join(f"[{i}]" for i in extra)
+                issues.append(SectionIssue(
+                    section=sec, problem="faithfulness_suspect",
+                    detail=f"来源{marks}不支持本句任何数据，请去掉这些编号只保留真正的出处：{sent[:100]}",
+                ))
+    return issues
 
-    review.sufficient = not review.issues
-    return review
+
+def review_report(llm: LLM, question: str, plan: Plan, report: str,
+                  kb: KnowledgeBase, previous: Review | None = None) -> Review:
+    issues = _rule_layer(report, question, plan, kb)
+    previous_claims = {
+        (c["sentence"], c["evidence_hash"]): c
+        for c in (previous.claims if previous else [])
+        if c.get("verdict") is not None
+    }
+    records = []
+    calls = 0
+    by_id = {s.id: s for s in kb.sources}
+    for sec, body in _split_report_sections(report).items():
+        if sec not in plan.outline:
+            continue
+        for sent, ids in _claims(body):
+            evidence = _evidence(kb, sent, ids)
+            fingerprint = content_hash(evidence)
+            verdict = None
+            method = "unverified"
+            if ids and all(i in by_id for i in ids):
+                flags = missing_numbers(sent, evidence, question)
+                cached = previous_claims.get((sent, fingerprint))
+                if flags:
+                    verdict, method = "不支持", "numeric"
+                elif cached:
+                    verdict, method = cached["verdict"], cached["method"]
+                elif calls < config.MAX_REVIEW_CLAIMS:
+                    verdict, method = judge(llm, sent, evidence), "llm"
+                    calls += 1
+                if verdict in {"不支持", "部分支持"} and not flags:
+                    issues.append(SectionIssue(
+                        section=sec, problem="faithfulness_suspect",
+                        detail=f"原文{verdict}：{sent[:120]}",
+                    ))
+                elif verdict is None:
+                    issues.append(SectionIssue(
+                        section=sec, problem="verification_incomplete",
+                        detail=f"尚未完成原文核验：{sent[:100]}",
+                    ))
+            records.append({
+                "section": sec, "sentence": sent, "source_ids": ids,
+                "verdict": verdict, "method": method, "evidence_hash": fingerprint,
+            })
+    unique = {}
+    for issue in issues:
+        unique.setdefault((issue.section, issue.problem, issue.detail), issue)
+    issues = list(unique.values())
+    return Review(
+        sufficient=not issues, issues=issues, total_claims=len(records),
+        checked_claims=sum(c["verdict"] is not None for c in records), claims=records,
+    )

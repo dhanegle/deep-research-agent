@@ -99,6 +99,38 @@ class TestRuleLayer:
         issues = _rule_layer(report, "毕业生数据", plan, kb)
         assert any(i.problem == "faithfulness_suspect" for i in issues)
 
+    def test_extra_citation_supporting_nothing_flagged(self):
+        # 实测缺口：被引来源拼成一份证据整体判定，只要一条支持整句就通过，
+        # 3B 多挂的编号查不出来（"2026年上半年…63.5%"引了 2020 年的旧报告）。
+        kb = _make_kb(("2026年半年度运行分析", "2026年上半年机电产品出口占出口总额的63.5%"),
+                      ("2020年进出口贸易研究报告", "2020年我国进出口规模持续扩大，结构不断优化"))
+        plan = _make_plan(["商品结构"])
+        report = ("# q\n\n## 商品结构\n\n2026年上半年，中国机电产品出口占出口总额的63.5%[1][2]。"
+                  "\n\n## 参考来源\n\n[1] x\n\n[2] y")
+        issues = _rule_layer(report, "2026年我国进出口情况", plan, kb)
+        assert any(i.problem == "faithfulness_suspect" and "[2]" in i.detail for i in issues)
+
+    def test_shared_year_does_not_count_as_attribution(self):
+        # 实测缺口：几乎每条来源都写着同一个年份，算作命中就让本规则对含年份的
+        # 句子（绝大多数句子）永远不触发——25.47 万亿那句多挂的两个编号漏掉了。
+        kb = _make_kb(("外贸市场分析", "2026年上半年我国进出口总值达25.47万亿元，同比增长16.9%"),
+                      ("出口增量预判", "2026年中国出口有望保持稳健增长"))
+        plan = _make_plan(["进出口总量"])
+        report = ("# q\n\n## 进出口总量\n\n2026年上半年，我国进出口总值达25.47万亿元，"
+                  "同比增长16.9%[1][2]。\n\n## 参考来源\n\n[1] x\n\n[2] y")
+        issues = _rule_layer(report, "2026年我国进出口情况", plan, kb)
+        assert any("[2]" in i.detail and "不支持本句任何数据" in i.detail for i in issues)
+
+    def test_multi_citation_each_supporting_part_kept(self):
+        # 合法多引用：两条各支持一部分，不能因"单条不支持整句"被拆掉。
+        kb = _make_kb(("出口数据", "2026年上半年出口14.73万亿元"),
+                      ("进口数据", "2026年上半年进口10.74万亿元"))
+        plan = _make_plan(["进出口总量"])
+        report = ("# q\n\n## 进出口总量\n\n2026年上半年出口14.73万亿元，进口10.74万亿元[1][2]。"
+                  "\n\n## 参考来源\n\n[1] x\n\n[2] y")
+        issues = _rule_layer(report, "2026年我国进出口情况", plan, kb)
+        assert not any("不支持本句任何数据" in i.detail for i in issues)
+
 
 class TestReplaceSection:
     def test_replaces_middle_section(self):
@@ -128,7 +160,7 @@ class TestReviewReport:
         plan = _make_plan(["毕业生总体情况"])
         report = "# q\n\n## 毕业生总体情况\n\n深圳大学5191名学子毕业，落实率95%[1]。\n\n## 参考来源\n\n[1] x"
         review_json = Review(sufficient=True, issues=[])
-        llm = ScriptedLLM(json_replies=[review_json])
+        llm = ScriptedLLM(json_replies=[review_json], judge_replies=["支持"])
         from agent.reviewer import review_report
         review = review_report(llm, "毕业生数据", plan, report, kb)
         assert review.sufficient is True
@@ -146,7 +178,7 @@ class TestReviewReport:
         from agent.reviewer import review_report
         review = review_report(llm, "毕业生数据", plan, report, kb)
         assert review.sufficient is False
-        assert review.gap_queries == ["2026年毕业生就业数据"]
+        assert review.gap_queries == ["毕业生数据 毕业生总体情况"]
 
     def test_faithfulness_suspect_confirmed_by_judge(self):
         kb = _make_kb(("就业数据", "2026届5191人毕业，落实率95%"))
@@ -161,9 +193,9 @@ class TestReviewReport:
         from agent.reviewer import review_report
         review = review_report(llm, "毕业生数据", plan, report, kb)
         assert any(i.problem == "faithfulness_suspect" for i in review.issues)
-        assert llm.n_judge >= 1
+        assert llm.n_judge == 0  # 已确定的数字错误不需要再询问模型。
 
-    def test_faithfulness_suspect_cleared_by_judge(self):
+    def test_numeric_issue_cannot_be_cleared_by_lenient_judge(self):
         kb = _make_kb(("就业数据", "2026届5191人毕业，落实率95%"))
         plan = _make_plan(["毕业生总体情况"])
         report = "# q\n\n## 毕业生总体情况\n\n深圳大学9999名学子毕业[1]。\n\n## 参考来源\n\n[1] x"
@@ -171,8 +203,9 @@ class TestReviewReport:
             SectionIssue(section="毕业生总体情况", problem="faithfulness_suspect",
                          detail="存疑数字：9999"),
         ])
-        # judge 返回"支持"→ 存疑标记被清除
+        # 模型即便准备回答“支持”，也不能推翻确定性的数字错误。
         llm = ScriptedLLM(json_replies=[review_json], judge_replies=["支持"])
         from agent.reviewer import review_report
         review = review_report(llm, "毕业生数据", plan, report, kb)
-        assert not any(i.problem == "faithfulness_suspect" for i in review.issues)
+        assert any(i.problem == "faithfulness_suspect" for i in review.issues)
+        assert llm.n_judge == 0

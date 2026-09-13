@@ -14,43 +14,25 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 
 from .search.base import SearchProvider
-from .search.pages import fetch_page
+from .search.pages import fetch_document
 
 from . import config
+from .dates import is_recent
+from .evidence import content_terms, evidence_blocks, select_evidence
 from .knowledge import (
     KnowledgeBase, _bigrams, ascii_proper_tokens, ascii_token_hit,
     query_tokens, token_coverage,
 )
 
-# 文库/课件站几乎没有可用正文，录用后摘要是空壳，报告会被带跑；
-# 题库/答疑站是大纲空词的字面命中大户——「政策影响因素」这类查询词
-# 完美命中选择题题面，任何搜索引擎都会把它们排在权威媒体前面。
-_BLOCKED_HOSTS = (
-    "docin.com", "doc88.com", "taodocs.com", "book118.com",
-    "360doc.com", "wenku.baidu.com", "max.book118.com",
-    "jutiku.cn", "xilvlaw.com", "wkda.cn", "027art.com",
-    "renrendoc.com", "cooco.net.cn", "eepw.com/shiti",
-)
-# 中央权威媒体与政府站点：相关性打分小幅加权，措辞不同也能排到普通站前面
-_AUTHORITY_HOSTS = (
-    ".gov.cn", "cctv.com", "cctv.cn", "news.cn", "xinhuanet.com",
-    "people.com.cn", "china.com.cn", "cetv.cn", "cnr.cn",
-)
-# 单位内部页面标题特征（公示/资格审查/放假通知……任何话题都成立）：
-# 这类页面字面密度高、更新勤，总量统计类查询下常压过权威报道，非权威域名一律降权
-_INTERNAL_PAGE_RE = re.compile(
-    r"公示|教务处|资格审查|录取名单|成绩查询|放假安排|校历|返校"
-    r"|关于做好.{0,12}的通知"
-)
-_JUNK_DIGEST = re.compile(
-    r"appkey|cf[_-]?app[_-]?waf|ac_opt|enablejavascript|just a moment|请开启\s*javascript",
-    re.I,
-)
 from .llm import LLM, tool_call_args, tool_call_name
+from .source_quality import (
+    authority_domains, authority_tier, is_blocked, is_internal_source, is_low_quality,
+)
 from .stats import RunStats
 from .trace import Trace
 
@@ -108,11 +90,6 @@ REACT_FALLBACK_PROMPT = """\
 path 必须原样来自之前的搜索结果，资料足够时选 finish。
 """
 
-DIGEST_PROMPT = (
-    "你是一个严谨的资料整理员。用不超过 250 字概括给定网页正文的关键事实，"
-    "保留具体数字、时间、机构名与结论，不要添加评论。只输出摘要正文。"
-)
-
 # 「调研一下2026年的毕业情况」→「2026年的毕业情况」：剥掉请求动词留核心
 _QUESTION_PREFIX = re.compile(
     r"^(请|帮我|我想|给我|麻烦)?(深度|全面|快速)?"
@@ -122,6 +99,16 @@ _QUESTION_PREFIX = re.compile(
 
 def _strip_question_verbs(question: str) -> str:
     return _QUESTION_PREFIX.sub("", question).strip() or question
+
+
+def _date_tag(published: str) -> str:
+    """候选列表里标注发布日期，让模型能判断新旧。
+
+    此前候选只有标题/路径/摘要，模型看不到任何时间信号——2025-11 的旧稿与
+    2026-06 的新稿在它眼里完全一样，于是照排序读到哪条用哪条。日期未知时
+    不标注（宁可缺失也不编造）。
+    """
+    return f"（{published}）" if published else ""
 
 
 # 泛词二元组：出现在查询与核心的交集里不代表有主题锚定（「情况」「分析」任何题都带）
@@ -154,8 +141,10 @@ class Researcher:
         self.trace = trace
         self.emit = on_step or (lambda event, data: None)
         self._searched: set[str] = set()  # 本轮已执行过的搜索词（去重防空转）
+        self._failed_urls: set[str] = set()  # 抓取失败/被拒收的 URL，跨轮不再重试
         self._lock = threading.Lock()     # 并行执行工具时保护共享状态
         self._core = ""                   # 问题核心词（剥掉请求动词），大纲空词改写用
+        self._authority_passes = 0        # 已执行的权威定向检索次数（受预算约束）
 
     # ---- 主循环 ----------------------------------------------------------
     def run(self, question: str, outline: list[str], queries: list[str],
@@ -186,7 +175,7 @@ class Researcher:
         nudged = 0
 
         for step in range(max_steps):
-            if len(self.kb.sources) >= 8:
+            if len(self.kb.sources) >= config.MAX_SOURCES:
                 break
             if config.REACT_MODE == "prompt":
                 # 消融路径：全程提示词 JSON-ReAct，不使用原生 tool calling
@@ -293,13 +282,13 @@ class Researcher:
         core = self._core
         if not core or core in query or query in core:
             return query
-        shared = (_bigrams(query) & _bigrams(core)) - _GENERIC_BIGRAMS
+        shared = content_terms(query) & content_terms(core)
         if shared:
             return query
         return f"{core} {query}"
 
     def _filter_results(self, results: list, query: str) -> list:
-        """搜索结果相关性过滤与重排。
+        """搜索结果相关性过滤与权威重排。
 
         实测问题：查专有名词（如 "linuxsb"）时搜索引擎常返回泛主题页面
         （如"什么是Linux"），3B 模型照单全收导致报告跑题。
@@ -308,15 +297,36 @@ class Researcher:
           命中后不再用 0.35 覆盖率否决——否则 "linuxsb 主要 讨论 领域"
           会把真正的 linux.sb 主页丢掉（专有名词权重 1.5 / 总分 4.5 < 0.35）。
         - 纯中文（或只有年份）→ 覆盖率 ≥ 0.35，挡住只命中单个泛词的弱相关。
+        - 权威分层优先（本次改造）：此前权威只按单一 +0.15 加权，央视网与
+          县级政府网站同权，实测收录来源里权威域名仅占 4.6%。改为分层排序——
+          中央媒体(2) > 政府/统计机构(1) > 普通站点(0)，让 3B 模型优先读到
+          权威来源（模型只从候选里挑 2-3 条阅读，排序即决定它看不看得到）。
+          分层不是无条件顶置：权威项的相关性需与最佳项相差不超过 RELEVANCE_FLOOR，
+          避免把一个只沾边的政府页排到明显更对题的报道前面。
+        - 单位内部页拒收（本次改造）：非权威域下标题命中"公示/通知/资格审查"
+          的页面整条丢弃，不再降权。理由见 is_internal_source。
         """
         tokens = query_tokens(query)
         has_proper = bool(ascii_proper_tokens(tokens))
         q_tokens = query_tokens(getattr(self, "_question", query))
         q_terms = _bigrams(query) | _bigrams(getattr(self, "_question", query))
+        failed = getattr(self, "_failed_urls", set())
         scored = []
         for r in results:
-            host = (r.url or "").lower()
-            if any(b in host for b in _BLOCKED_HOSTS):
+            if r.url in failed:  # 反爬 412/无关正文拒收过的页面，别再喂给模型
+                continue
+            host = (urlparse(r.url).hostname or "").lower()
+            if is_blocked(host, r.url):
+                continue
+            # 非权威域的单位内部页（公示/通知/资格审查…）整条拒收。此前只做 -0.15
+            # 降权，实测拦不住：北京体育大学就业指导中心的《关于开展2026届毕业生
+            # 就业意向和进展调查的通知》在 51 份报告里被收录 3 次，正文全是调查安排、
+            # 没有一个统计数据，却因字面密度高挤进候选前 5。这类页面任何话题下都不含
+            # 一手数据，属于"收录了也用不上"——直接拒收比降权更省一轮抓取与摘要。
+            # 权威域的「通知」是部委文件，恰是统计类问题的最佳来源，由
+            # is_internal_source 内部豁免（它还会放行无域名的本地语料）。
+            if is_internal_source(host, r.title or ""):
+                self.trace.log("internal_page_dropped", url=r.url, title=r.title)
                 continue
             text = f"{r.title} {r.snippet} {r.url}"
             cov = token_coverage(text, tokens)
@@ -329,15 +339,71 @@ class Researcher:
                 # qcov：搜索词对不上但页面明显对题（「出口高增长能延续吗」对「未来展望」）
                 continue
             overlap = sum(1 for t in q_terms if t in text)
-            auth = 0.15 if any(a in host for a in _AUTHORITY_HOSTS) else 0.0
-            cov_eff = cov + auth
-            # 非权威域名的单位内部页面（公示/通知/教务处…）降权：
-            # 权威域不受影响——部委通知恰恰是统计类问题的最佳来源
-            if auth == 0.0 and _INTERNAL_PAGE_RE.search(r.title or ""):
-                cov_eff -= 0.15
-            scored.append((cov_eff, qcov, overlap, r))
-        scored.sort(key=lambda x: (-x[0], -x[1], -x[2]))
-        return [r for _, _, _, r in scored[:5]]
+            tier = authority_tier(host)
+            score = cov
+            if tier == 0:
+                # UGC/自媒体平台质量方差大，小幅降权
+                # （单位内部页不在此处——上面已整条拒收）
+                if is_low_quality(host):
+                    score -= 0.10
+            # 时效只做**正向**奖励，不惩罚旧内容。离线回放发现：一旦惩罚旧的，
+            # "日期未知"（多数政府一手来源的 URL 不含日期）就会相对占优，
+            # 把确知较旧的央视/新华网挤出 top-5（22 份快照出现，权威占比倒退）。
+            # 只奖励新鲜则不会制造这种悖论——旧文只是不占便宜，不吃亏。
+            if config.FRESH_DAYS and is_recent(r.published_at, config.FRESH_DAYS):
+                score += config.FRESH_BONUS
+            scored.append((tier, score, qcov, overlap, cov, r))
+        if not scored:
+            return []
+        # 排序优先级：权威层级（受相关性下限约束）→ 排序分（相关性±质量/时效调整）
+        # → 问题词覆盖 → 二元组重叠。floor 用**纯相关性** cov 计算，
+        # 不让时效奖励抬高下限。
+        best = max(x[4] for x in scored)
+        floor = best - 0.3
+        scored.sort(key=lambda x: (-(x[0] if x[4] >= floor else 0), -x[1], -x[2], -x[3]))
+        return [r for *_, r in scored[:5]]
+
+    def _authority_pass(self, query: str, kept: list, seen_urls: dict[str, str]) -> list:
+        """常规搜索没有权威来源时，对权威域名做一次定向检索并前置。
+
+        实测依据：原始搜索结果里央媒只占 2.8%，仅 12.9% 的查询能搜到任何央媒，
+        权威结果平均排在原始列表第 4.3 位——被动等待排序把央视顶上来不够，
+        必须主动去取。Tavily 用 include_domains、博查用 include（实测均生效，
+        且博查不支持泛域 "gov.cn"，白名单已逐个枚举具体站点）。
+
+        预算受 AUTHORITY_PASS_BUDGET 约束，避免每轮搜索都翻倍消耗额度。
+        """
+        if not config.AUTHORITY_PASS:
+            return kept
+        with self._lock:
+            if self._authority_passes >= config.AUTHORITY_PASS_BUDGET:
+                return kept
+            self._authority_passes += 1
+        try:
+            extra = self.provider.search(query, max_results=8,
+                                         include_domains=list(authority_domains()))
+        except TypeError:
+            # 提供方未实现 include_domains（自定义 SearchProvider）→ 静默跳过
+            self.trace.log("authority_search_unsupported", query=query)
+            return kept
+        except Exception as e:
+            self.trace.log("authority_search_fail", query=query, error=str(e)[:200])
+            return kept
+        self.stats.searches += 1
+        self.stats.authority_searches += 1
+        picked = self._filter_results(extra, query)
+        self.trace.log("authority_search", query=query, results=len(extra), kept=len(picked))
+        self.emit("search", {"query": query, "results": len(picked), "dropped": 0,
+                             "authority": True})
+        if not picked:
+            return kept
+        with self._lock:
+            for r in picked:
+                seen_urls.setdefault(r.url, r.title)
+        # 权威结果前置，普通结果顺延并去重
+        top_urls = {r.url for r in picked}
+        return (picked + [r for r in kept if r.url not in top_urls])[:8]
+
 
     # ---- 工具执行 ----------------------------------------------------------
     def _dispatch_safe(self, name: str, args: dict, seen_urls: dict[str, str]) -> tuple[bool, str]:
@@ -365,7 +431,7 @@ class Researcher:
             else:
                 with self._lock:
                     dup = q_key in self._searched
-                    over_budget = len(self._searched) >= 12
+                    over_budget = len(self._searched) >= config.MAX_SEARCHES
                     self._searched.add(q_key)
             if dup:
                 # 3B 典型空转：反复搜同一关键词而不去阅读。直接顶回去读未读链接。
@@ -395,6 +461,11 @@ class Researcher:
                     kept = self._filter_results(extra, core)
                     raw_n += len(extra)
                     self.trace.log("tool_search_retry", query=core, results=len(extra), kept=len(kept))
+            # 常规召回里没有权威来源 → 做一次权威域名定向检索并前置，
+            # 否则 3B 只能在小站/聚合站里挑，报告来源档次被搜索源决定
+            if kept and not any(authority_tier((urlparse(r.url).hostname or "").lower()) > 0
+                                for r in kept):
+                kept = self._authority_pass(query, kept, seen_urls)
             self.trace.log("tool_search", query=query, results=len(results), kept=len(kept))
             self.emit("search", {
                 "query": query, "results": len(kept),
@@ -403,7 +474,11 @@ class Researcher:
             with self._lock:
                 for r in kept:
                     seen_urls.setdefault(r.url, r.title)
-            lines = [f"{i}. {r.title}\n   路径: {r.url}\n   {r.snippet[:120]}" for i, r in enumerate(kept, 1)]
+            lines = [
+                f"{i}. {r.title}{_date_tag(r.published_at)}\n"
+                f"   路径: {r.url}\n   {r.snippet[:120]}"
+                for i, r in enumerate(kept, 1)
+            ]
             if not lines:
                 return True, (
                     f"搜到 {raw_n} 条但均未命中关键词，已丢弃。"
@@ -422,6 +497,8 @@ class Researcher:
             try:
                 digest, sid = self._read_and_digest(url, seen_urls[url])
             except Exception as e:
+                with self._lock:
+                    self._failed_urls.add(url)
                 return True, f"文档读取失败（{e}），请换一个阅读。"
             return True, f"已收录资料 [{sid}]《{seen_urls[url]}》\n摘要：{digest[:200]}"
 
@@ -446,26 +523,32 @@ class Researcher:
         with self._lock:
             if url in self.kb._by_url:  # 补搜轮常重复阅读已收录页面，跳过重复抓取与摘要
                 return "（该资料此前已收录，无需重复阅读）", self.kb._by_url[url]
-        text = fetch_page(url)
+        try:
+            document = fetch_document(url)
+            text = document.text
+            terms = content_terms(getattr(self, "_question", ""))
+            evidence = "\n".join(evidence_blocks(text)).lower()
+            if terms and sum(term in evidence for term in terms) < min(2, len(terms)):
+                raise ValueError("正文与调研主题无关")
+        except ValueError as exc:
+            self.stats.pages_rejected += 1
+            self.trace.log("source_rejected", url=url, reason=str(exc))
+            self.emit("research", {"status": f"未收录《{title}》：{exc}"})
+            raise
         digest = self._digest(text)
-        if _JUNK_DIGEST.search(digest) or len(re.sub(r"\s+", "", digest)) < 40:
-            raise ValueError("页面无有效正文（验证页或空壳）")
         with self._lock:
-            sid = self.kb.add(url, title, digest)
+            if len(self.kb) >= config.MAX_SOURCES:
+                raise ValueError("来源预算已用完")
+            sid = self.kb.add(url, title, digest, text=text,
+                              published_at=document.published_at, publisher=document.publisher,
+                              retrieved_at=document.retrieved_at)
         self.stats.pages_fetched += 1
         self.trace.log("tool_read", url=url, title=title, source_id=sid, digest=digest[:300])
         self.emit("read", {"source_id": sid, "title": title, "url": url})
         return digest, sid
 
     def _digest(self, text: str) -> str:
-        text = (text or "").strip()[:6000]
-        if not text:
-            return "（页面无有效正文）"
-        self.stats.digest_calls += 1
-        return self.llm.chat_text([
-            {"role": "system", "content": DIGEST_PROMPT},
-            {"role": "user", "content": text},
-        ]) or "（摘要生成失败）"
+        return select_evidence(text, getattr(self, "_question", ""), max_chars=900)
 
     # ---- 防线 3：规则兜底采集 ------------------------------------------------
     def scripted_collect(self, queries: list[str], per_query_pages: int = 2) -> None:
@@ -476,17 +559,31 @@ class Researcher:
         """
         self.trace.log("scripted_collect_start", queries=queries)
         for query in queries:
+            if len(self.kb) >= config.MAX_SOURCES:
+                break
             query = self._anchor_query(query)
             try:
                 results = self.provider.search(query, max_results=per_query_pages + 3)
+                self.stats.searches += 1
             except Exception as e:
                 self.trace.log("scripted_search_fail", query=query, error=str(e))
                 continue
             kept = self._filter_results(results, query)
+            # 兜底采集同样争取权威来源：无权威时做一次定向检索并前置
+            if kept and not any(authority_tier((urlparse(r.url).hostname or "").lower()) > 0
+                                for r in kept):
+                kept = self._authority_pass(query, kept, {})
             self.trace.log("scripted_search", query=query, kept=len(kept))
-            for r in kept[:per_query_pages]:
+            # 失败不占配额、不重试：第 1 名被反爬挡住时顺延读下一条，
+            # 否则海关官网一个 412 就能让整个查询颗粒无收（实测踩过）。
+            collected = 0
+            for r in kept:
+                if collected >= per_query_pages or len(self.kb) >= config.MAX_SOURCES:
+                    break
                 try:
                     self._read_and_digest(r.url, r.title)
+                    collected += 1
                 except Exception as e:
+                    self._failed_urls.add(r.url)
                     self.trace.log("scripted_read_fail", url=r.url, error=str(e))
         self.trace.log("scripted_collect_end", sources=len(self.kb.sources))

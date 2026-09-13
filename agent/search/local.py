@@ -87,7 +87,9 @@ class LocalDocsProvider(SearchProvider):
                 out.append(t)
         return out
 
-    def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
+    def search(self, query: str, max_results: int = 5,
+               include_domains: list[str] | None = None) -> list[SearchResult]:
+        # 本地语料没有域名概念，include_domains 参数忽略
         terms = [t for t in query.split() if len(t) >= 2]
         if not terms:
             terms = [query.strip()]
